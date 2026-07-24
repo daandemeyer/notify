@@ -16,6 +16,8 @@
 - FIX: [windows] emit a rescan event when `ReadDirectoryChangesW` discards change details [#964]
 - FEATURE: [windows] report created file/folder kinds when they can be determined [#935]
 - CHANGE: [macOS] improve FSEvents callback performance by avoiding unnecessary allocations and repeated handler locking
+- FIX: [macOS] refuse to create an FSEvents stream carrying more paths than macOS handles without closing a file descriptor this process owns
+- CHANGE: [macOS] pass a single FSEvents stream root for watches nested inside another watch on the same volume; a nested watch no longer reports a root-changed event of its own when an ancestor is renamed
 - PERF: [kqueue] avoid filesystem walks for recursive kqueue unwatch
 - FIX: never abandon a recursive watch, report what failed instead
 
