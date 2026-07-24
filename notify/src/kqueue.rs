@@ -6,7 +6,8 @@
 
 use super::event::*;
 use super::{
-    Config, Error, ErrorKind, EventHandler, EventKindMask, RecursiveMode, Result, Watcher,
+    Config, Error, ErrorKind, EventHandler, EventKindMask, RecursiveMode, Result, WatchFilter,
+    Watcher,
 };
 use crate::paths::{
     absolute_path, is_preserved_watch_root, preserved_watch_mode, preserved_watch_roots,
@@ -189,7 +190,6 @@ impl EventLoop {
                     let event_path = watch
                         .map(|watch| watch.reported_path.clone())
                         .unwrap_or_else(|| path.clone());
-                    let is_user_watch = watch.is_some_and(|watch| watch.is_user_watch);
                     let event = match data {
                         /*
                         TODO: Differentiate folders and files
@@ -236,6 +236,7 @@ impl EventLoop {
                                                 reported_file.clone(),
                                             ),
                                             false,
+                                            true,
                                         ));
 
                                         Event::new(EventKind::Create(if file.is_dir() {
@@ -299,15 +300,23 @@ impl EventLoop {
                             // also introduce a race condition, where multiple files could
                             // all ready be remove from the directory, and we could get out
                             // of sync.
-                            // So for now, until we find a better solution, let remove and
-                            // readd the whole directory.
-                            // This is a expensive operation, as we recursive through all
-                            // subdirectories.
-                            remove_watches.push((path.clone(), false));
-                            add_watches.push((
-                                WatchPath::from_parts(path.clone(), event_path.clone()),
-                                is_user_watch,
-                            ));
+                            // So for now, until we find a better solution, re-add the whole
+                            // directory: the walk registers watches for entries that appeared
+                            // (kqueue treats re-adding an existing kevent as an update, and
+                            // deleted children fire their own NOTE_DELETE), merging into the
+                            // existing entries. This is an expensive operation, as we recurse
+                            // through all subdirectories.
+                            //
+                            // The re-add is a non-user merge: it must not disturb the entry's
+                            // user metadata, so it re-walks with the entry's current merged
+                            // mode and lets `WatchMetadata::new` preserve the user fields.
+                            if let Some(watch) = watch {
+                                add_watches.push((
+                                    WatchPath::from_parts(path.clone(), event_path.clone()),
+                                    false,
+                                    watch.is_recursive,
+                                ));
+                            }
                             Ok(Event::new(EventKind::Modify(ModifyKind::Any)).add_path(event_path))
                         }
 
@@ -349,8 +358,8 @@ impl EventLoop {
             self.remove_watch(path, remove_recursive).ok();
         }
 
-        for (path, is_user_watch) in add_watches {
-            self.add_watch(path, true, is_user_watch).ok();
+        for (path, is_user_watch, is_recursive) in add_watches {
+            self.add_watch(path, is_recursive, is_user_watch).ok();
         }
 
         // Apply recursive watch changes before reporting the events that caused them. Event
@@ -369,6 +378,7 @@ impl EventLoop {
     ) -> Result<()> {
         let path_is_dir = metadata(&path.absolute).map_err(Error::io)?.is_dir();
         let requested_is_recursive = is_recursive && path_is_dir;
+        let mut inherited_recursive_root = None;
         if is_user_watch {
             if let Some(watch) = self
                 .watches
@@ -385,51 +395,22 @@ impl EventLoop {
                 // instead of merging with the previous metadata. If the current entry also carries
                 // recursive coverage from an ancestor, remember that ancestor before removal so we
                 // can rebuild that inherited coverage below.
-                let inherited_recursive_root =
+                inherited_recursive_root =
                     if !requested_is_recursive && path_is_dir && watch.is_recursive {
                         recursive_user_watch_ancestor(&path.absolute, self.watches.iter())
                     } else {
                         None
                     };
-                let replaced_path = path.absolute.clone();
-                self.remove_watch(replaced_path.clone(), false)?;
-
-                if let Some((ancestor_path, ancestor_reported_path)) = inherited_recursive_root {
-                    // Removing a directory watch removes its recursively inherited children too.
-                    // Re-add them as non-user watches so the ancestor recursive watch still covers
-                    // this subtree after the user watch is replaced.
-                    for entry in WalkDir::new(&replaced_path)
-                        .follow_links(self.follow_symlinks)
-                        .into_iter()
-                    {
-                        let absolute = match entry {
-                            Ok(entry) => entry.into_path(),
-                            Err(err) if walkdir_error_is_not_found(&err) => continue,
-                            Err(err) => return Err(map_walkdir_error(err)),
-                        };
-                        let requested =
-                            reported_path(&ancestor_path, &ancestor_reported_path, &absolute);
-                        let result = self.add_single_watch(
-                            WatchPath::from_parts(absolute, requested),
-                            true,
-                            false,
-                        );
-                        if let Err(err) = result {
-                            if !error_is_not_found(&err) {
-                                return Err(err);
-                            }
-                        }
-                    }
-                }
+                self.remove_watch(path.absolute.clone(), false)?;
             }
         }
 
         // If the watch is not recursive, or if we determine (by stat'ing the path to get its
         // metadata) that the watched path is not a directory, add a single path watch.
         if !requested_is_recursive {
-            self.add_single_watch(path, false, is_user_watch)?;
+            self.add_single_watch(path.clone(), false, is_user_watch)?;
         } else {
-            let root = path;
+            let root = path.clone();
             let mut first = true;
             for entry in WalkDir::new(&root.absolute)
                 .follow_links(self.follow_symlinks)
@@ -443,6 +424,29 @@ impl EventLoop {
                     is_user_watch && first,
                 )?;
                 first = false;
+            }
+        }
+
+        if let Some((ancestor_path, ancestor_reported_path)) = inherited_recursive_root {
+            // Removing a directory watch removes its recursively inherited children too. Re-add
+            // them as non-user watches so the ancestor recursive watch still covers this subtree
+            // after the user watch is replaced. This runs after the replacement watch is
+            // installed, so the explicit entry owns its own metadata and the rebuilt children
+            // merge inherited coverage on top of it rather than being overwritten by it.
+            for entry in WalkDir::new(&path.absolute).follow_links(self.follow_symlinks) {
+                let absolute = match entry {
+                    Ok(entry) => entry.into_path(),
+                    Err(err) if walkdir_error_is_not_found(&err) => continue,
+                    Err(err) => return Err(map_walkdir_error(err)),
+                };
+                let requested = reported_path(&ancestor_path, &ancestor_reported_path, &absolute);
+                let result =
+                    self.add_single_watch(WatchPath::from_parts(absolute, requested), true, false);
+                if let Err(err) = result {
+                    if !error_is_not_found(&err) {
+                        return Err(err);
+                    }
+                }
             }
         }
 
@@ -476,13 +480,7 @@ impl EventLoop {
             .add_filename(&path.absolute, event_filter, filter_flags)
             .map_err(|e| Error::io(e).add_path(path.requested.clone()))?;
         let existing_watch = self.watches.get(&path.absolute);
-        let watch = Watch::new(
-            &path,
-            is_recursive,
-            is_user_watch,
-            existing_watch,
-            self.watches.iter(),
-        );
+        let watch = Watch::new(&path, is_recursive, is_user_watch, existing_watch);
         self.watches.insert(path.absolute, watch);
 
         Ok(())
@@ -619,7 +617,19 @@ impl Watcher for KqueueWatcher {
         )
     }
 
-    fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
+    fn watch_filtered(
+        &mut self,
+        path: &Path,
+        recursive_mode: RecursiveMode,
+        watch_filter: WatchFilter,
+    ) -> Result<()> {
+        if !watch_filter.is_accept_all() {
+            // Filtering is not implemented for this backend yet. Refuse rather than
+            // silently watching more than the caller asked for.
+            return Err(Error::generic(
+                "this watcher does not support watch filters yet",
+            ));
+        }
         self.watch_inner(path, recursive_mode)
     }
 
@@ -753,6 +763,41 @@ mod tests {
             .collect();
         assert_eq!(watched.get(dir.path()), Some(&true));
         assert_eq!(watched.get(&child), Some(&false));
+
+        Ok(())
+    }
+
+    // The directory refresh triggered by a link-count change re-adds the directory as a
+    // non-user watch instead of removing and re-adding it as a user watch. That is only
+    // correct if a non-user re-add merges into the existing entry without disturbing the
+    // mode and reported path the user asked for.
+    #[test]
+    fn non_user_readd_preserves_user_metadata(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child)?;
+
+        let kqueue = kqueue::Watcher::new()?;
+        let mut event_loop = EventLoop::new(kqueue, Box::new(|_| {}), false, EventKindMask::ALL)?;
+
+        event_loop.add_watch(
+            WatchPath::from_parts(dir.path().to_path_buf(), PathBuf::from("reported-root")),
+            false,
+            true,
+        )?;
+
+        // Mirrors the refresh the event loop performs for a watched directory.
+        event_loop.add_watch(
+            WatchPath::from_parts(dir.path().to_path_buf(), PathBuf::from("reported-root")),
+            false,
+            false,
+        )?;
+
+        let watch = event_loop.watches.get(dir.path()).expect("root watch");
+        assert!(watch.is_user_watch, "the entry must stay a user watch");
+        assert!(!watch.user_is_recursive, "the requested mode must survive");
+        assert_eq!(watch.reported_path, PathBuf::from("reported-root"));
 
         Ok(())
     }

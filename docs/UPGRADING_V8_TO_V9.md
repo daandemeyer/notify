@@ -104,6 +104,67 @@ watcher.watch(path, notify::RecursiveMode::NonRecursive)?;
 watcher.unwatch(path)?;
 ```
 
+### 5) `Watcher::watch_filtered` is the required trait method
+
+v9 adds `Watcher::watch_filtered(path, recursive_mode, watch_filter)`, which excludes
+directories rejected by a `WatchFilter` from the watch. It is now the required method of the
+`Watcher` trait; `Watcher::watch` is a provided method that forwards to it with
+`WatchFilter::accept_all()`.
+
+Users of `Watcher` are unaffected: `watch` keeps working unchanged. Implementors of the trait
+must rename their `watch` implementation to `watch_filtered` and accept the extra parameter.
+
+The filter gates directories only: watching a non-directory path must never be affected by
+it. Two restrictions keep the semantics simple, and implementations must enforce both by
+returning an error while leaving all watches unchanged:
+
+- Watching a directory the filter itself rejects returns `ErrorKind::PathExcluded`. A root
+  that is a symlink to a directory is checked against both the link path and its resolved
+  target.
+- A directory watch carrying a filter should not overlap another directory watch in either
+  direction, because filters cannot be merged across watches; the in-tree backends refuse
+  this with `ErrorKind::WatchOverlap`. Watches whose filters are all
+  `WatchFilter::accept_all` may overlap as before, and file watches never conflict.
+
+`WatchFilter::allows_dir(path)` implements the directory gate, including the symlink-target
+check, and is the method implementations should call whenever they encounter a directory.
+
+The overlap barrier itself is an implementation detail of the in-tree backends and is not
+exposed, so an out-of-tree `Watcher` is not required to reproduce it. If you do not enforce
+it, document that overlapping filtered watches are unsupported for your backend rather than
+silently merging or dropping filters.
+
+Two new `ErrorKind` variants, `PathExcluded` and `WatchOverlap`, are added. `ErrorKind` is
+not `#[non_exhaustive]`, so any exhaustive `match` over it needs a new arm.
+
+Before (v8):
+
+```rust
+impl Watcher for MyWatcher {
+    fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> notify::Result<()> {
+        // ...
+    }
+    // ...
+}
+```
+
+After (v9):
+
+```rust
+impl Watcher for MyWatcher {
+    fn watch_filtered(
+        &mut self,
+        path: &Path,
+        recursive_mode: RecursiveMode,
+        watch_filter: notify::WatchFilter,
+    ) -> notify::Result<()> {
+        // Gate directories on the filter via `watch_filter.allows_dir(dir)`.
+        // ...
+    }
+    // ...
+}
+```
+
 ## Non-breaking changes but worth mentioning
 
 ### Event-kind filtering was added

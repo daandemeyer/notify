@@ -86,7 +86,7 @@ use std::{
 use rustc_hash::FxHashMap as HashMap;
 use time::now;
 
-pub use cache::{FileIdCache, NoCache, RecommendedCache};
+pub use cache::{FileIdCache, NoCache, RecommendedCache, WatchRoot};
 
 #[cfg(not(target_family = "wasm"))]
 pub use file_id_map::FileIdMap;
@@ -216,7 +216,7 @@ pub(crate) struct DebounceDataInner<T> {
     queues: HashMap<PathBuf, Queue>,
     /// Registered watch roots, kept **sorted by path** so that `add_root`
     /// can dedupe via binary search in O(log N) and doesn't suffer from injection
-    roots: VecDeque<(PathBuf, RecursiveMode)>,
+    roots: VecDeque<WatchRoot>,
     cache: T,
     rename_event: Option<(DebouncedEvent, Option<FileId>)>,
     rescan_event: Option<DebouncedEvent>,
@@ -366,9 +366,9 @@ impl<T: FileIdCache> DebounceDataInner<T> {
         for ancestor in path.ancestors() {
             if let Ok(index) = self
                 .roots
-                .binary_search_by(|(root, _)| root.as_path().cmp(ancestor))
+                .binary_search_by(|root| root.path.as_path().cmp(ancestor))
             {
-                if self.roots[index].1 == RecursiveMode::Recursive {
+                if self.roots[index].recursive_mode == RecursiveMode::Recursive {
                     return RecursiveMode::Recursive;
                 }
             }
@@ -602,12 +602,18 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
 
         match data
             .roots
-            .binary_search_by(|(p, _)| p.as_path().cmp(path.as_path()))
+            .binary_search_by(|root| root.path.as_path().cmp(path.as_path()))
         {
             Ok(_) => return, // already registered
             Err(pos) => {
                 // `VecDeque::insert` is O(min(pos, len - pos))
-                data.roots.insert(pos, (path.clone(), recursive_mode));
+                data.roots.insert(
+                    pos,
+                    WatchRoot {
+                        path: path.clone(),
+                        recursive_mode,
+                    },
+                );
             }
         }
 
@@ -616,10 +622,24 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
 
     fn remove_root(&mut self, path: impl AsRef<Path>) {
         let mut data = self.data.inner.lock().unwrap();
+        let path = path.as_ref();
 
-        data.roots.retain(|(root, _)| !root.starts_with(&path));
+        // Unwatching a path only removes that watch, so roots nested under it are still
+        // watched and must keep their bookkeeping. Their cached IDs go away with the
+        // subtree drop below, so re-fingerprint each survivor afterwards.
+        let surviving_nested_roots: Vec<_> = data
+            .roots
+            .iter()
+            .filter(|root| root.path.starts_with(path) && root.path.as_path() != path)
+            .cloned()
+            .collect();
 
-        data.cache.remove_path(path.as_ref());
+        data.roots.retain(|root| root.path.as_path() != path);
+
+        data.cache.remove_path(path);
+        for root in surviving_nested_roots {
+            data.cache.add_path(&root.path, root.recursive_mode);
+        }
     }
 
     pub fn watch(
@@ -926,7 +946,12 @@ mod tests {
             })
         }
 
-        fn watch(&mut self, path: &Path, _recursive_mode: RecursiveMode) -> notify::Result<()> {
+        fn watch_filtered(
+            &mut self,
+            path: &Path,
+            _recursive_mode: RecursiveMode,
+            _watch_filter: notify::WatchFilter,
+        ) -> notify::Result<()> {
             if path == self.fail_path {
                 Err(Error::path_not_found())
             } else {
@@ -960,7 +985,12 @@ mod tests {
             Ok(Self::default())
         }
 
-        fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> notify::Result<()> {
+        fn watch_filtered(
+            &mut self,
+            path: &Path,
+            recursive_mode: RecursiveMode,
+            _watch_filter: notify::WatchFilter,
+        ) -> notify::Result<()> {
             self.watched.push((path.to_path_buf(), recursive_mode));
             Ok(())
         }
@@ -1041,7 +1071,10 @@ mod tests {
         MockTime::set_time(time);
 
         let mut state = test_case.state.into_debounce_data_inner(time);
-        state.roots = VecDeque::from([(PathBuf::from("/"), RecursiveMode::Recursive)]);
+        state.roots = VecDeque::from([WatchRoot {
+            path: PathBuf::from("/"),
+            recursive_mode: RecursiveMode::Recursive,
+        }]);
 
         let mut prev_event_time = Duration::default();
 
@@ -1127,8 +1160,14 @@ mod tests {
         let state = DebounceDataInner {
             queues: HashMap::default(),
             roots: VecDeque::from([
-                (PathBuf::from("root"), RecursiveMode::NonRecursive),
-                (PathBuf::from("root/nested"), RecursiveMode::Recursive),
+                WatchRoot {
+                    path: PathBuf::from("root"),
+                    recursive_mode: RecursiveMode::NonRecursive,
+                },
+                WatchRoot {
+                    path: PathBuf::from("root/nested"),
+                    recursive_mode: RecursiveMode::Recursive,
+                },
             ]),
             cache: NoCache,
             rename_event: None,
@@ -1455,10 +1494,18 @@ mod tests {
         assert!(err.origin.is_some());
         assert_eq!(err.remaining.len(), 1);
 
-        let roots = debouncer.data.inner.lock().unwrap().roots.clone();
+        let roots: Vec<_> = debouncer
+            .data
+            .inner
+            .lock()
+            .unwrap()
+            .roots
+            .iter()
+            .map(|root| (root.path.clone(), root.recursive_mode))
+            .collect();
         assert_eq!(
             roots,
-            VecDeque::from([(PathBuf::from("ok1"), RecursiveMode::Recursive)])
+            vec![(PathBuf::from("ok1"), RecursiveMode::Recursive)]
         );
 
         Ok(())
@@ -1505,6 +1552,93 @@ mod tests {
             debouncer.watched_paths()?,
             vec![(path3, RecursiveMode::Recursive)]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn unwatch_parent_preserves_nested_root() -> Result<(), Box<dyn std::error::Error>> {
+        let mut debouncer = new_debouncer_opt::<_, TrackingWatcher, FileIdMap>(
+            Duration::from_millis(20),
+            Some(Duration::from_millis(5)),
+            |_| {},
+            FileIdMap::new(),
+            notify::Config::default(),
+        )?;
+
+        let tmpdir = tempdir()?;
+        let nested = tmpdir.path().join("nested");
+        fs::create_dir(&nested)?;
+        let nested_file = nested.join("file.txt");
+        fs::write(&nested_file, b"content")?;
+
+        debouncer.watch(tmpdir.path(), RecursiveMode::Recursive)?;
+        debouncer.watch(&nested, RecursiveMode::Recursive)?;
+        debouncer.unwatch(tmpdir.path())?;
+
+        // Copy out what the assertions need and release the lock first: a panic while the
+        // guard is held poisons the mutex, and the debouncer's drop then panics too.
+        let (roots, nested_file_cached) = {
+            let data = debouncer.data.inner.lock().unwrap();
+            let roots = data
+                .roots
+                .iter()
+                .map(|root| root.path.clone())
+                .collect::<Vec<_>>();
+            let cached = data.cache.cached_file_id(&nested_file).is_some();
+            (roots, cached)
+        };
+
+        assert_eq!(
+            roots,
+            vec![nested.clone()],
+            "unwatching a parent must not drop roots nested under it"
+        );
+        assert!(
+            nested_file_cached,
+            "removing the parent must rebuild cache coverage for the surviving nested root"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn unwatch_not_found_preserves_nested_roots() -> Result<(), Box<dyn std::error::Error>> {
+        let mut debouncer = new_debouncer_opt::<_, TrackingWatcher, FileIdMap>(
+            Duration::from_millis(20),
+            Some(Duration::from_millis(5)),
+            |_| {},
+            FileIdMap::new(),
+            notify::Config::default(),
+        )?;
+
+        let tmpdir = tempdir()?;
+        let nested = tmpdir.path().join("nested");
+        fs::create_dir(&nested)?;
+        let nested_file = nested.join("file.txt");
+        fs::write(&nested_file, b"content")?;
+
+        debouncer.watch(&nested, RecursiveMode::Recursive)?;
+
+        // The parent was never watched: the backend reports WatchNotFound and changes
+        // nothing, so the error propagates and the nested root's bookkeeping and cached
+        // IDs must stay untouched.
+        let result = debouncer.unwatch(tmpdir.path());
+        assert!(matches!(&result, Err(error) if matches!(error.kind, ErrorKind::WatchNotFound)));
+
+        let (roots, nested_file_cached) = {
+            let data = debouncer.data.inner.lock().unwrap();
+            let roots = data
+                .roots
+                .iter()
+                .map(|root| root.path.clone())
+                .collect::<Vec<_>>();
+            let cached = data.cache.cached_file_id(&nested_file).is_some();
+            (roots, cached)
+        };
+
+        assert_eq!(roots, vec![nested.clone()]);
+        assert!(nested_file_cached);
 
         Ok(())
     }

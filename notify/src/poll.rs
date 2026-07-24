@@ -5,7 +5,7 @@
 
 use crate::{
     paths::{absolute_path, WatchPath},
-    unbounded, Config, Error, EventHandler, Receiver, RecursiveMode, Sender, Watcher,
+    unbounded, Config, Error, EventHandler, Receiver, RecursiveMode, Sender, WatchFilter, Watcher,
 };
 use std::{
     collections::HashMap,
@@ -737,7 +737,19 @@ impl Watcher for PollWatcher {
         Self::new(event_handler, config)
     }
 
-    fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> crate::Result<()> {
+    fn watch_filtered(
+        &mut self,
+        path: &Path,
+        recursive_mode: RecursiveMode,
+        watch_filter: WatchFilter,
+    ) -> crate::Result<()> {
+        if !watch_filter.is_accept_all() {
+            // Filtering is not implemented for this backend yet. Refuse rather than
+            // silently watching more than the caller asked for.
+            return Err(Error::generic(
+                "this watcher does not support watch filters yet",
+            ));
+        }
         self.watch_inner(path, recursive_mode)
     }
 

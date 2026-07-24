@@ -182,6 +182,7 @@ pub use config::{Config, PathOp, RecursiveMode, WatchPathConfig, WindowsPathSepa
 pub use error::{Error, ErrorKind, Result, UpdatePathsError};
 pub use notify_types::event::{self, Event, EventKind, EventKindMask};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub(crate) type StdResult<T, E> = std::result::Result<T, E>;
 pub(crate) type Receiver<T> = std::sync::mpsc::Receiver<T>;
@@ -346,6 +347,112 @@ pub enum WatcherKind {
     NullWatcher,
 }
 
+type FilterFn = dyn Fn(&Path) -> bool + Send + Sync;
+
+/// Directory filter to limit what gets watched.
+///
+/// A directory for which the filter returns `false` is not watched: recursive scans do not
+/// descend into it and events beneath it are suppressed. The filter receives absolute paths,
+/// resolved as described on [`Watcher::watch_filtered`]. It is only ever applied to
+/// directories: it is not applied to non-directory children of an accepted directory (events
+/// for files inside a watched directory are always delivered), and watching a non-directory
+/// path is never affected by it.
+#[derive(Clone)]
+pub struct WatchFilter(Option<Arc<FilterFn>>);
+
+impl std::fmt::Debug for WatchFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("WatchFilter")
+            .field(&self.0.as_ref().map_or("no filter", |_| "filter fn"))
+            .finish()
+    }
+}
+
+impl WatchFilter {
+    /// A filter that accepts any path, use to watch all paths.
+    #[must_use]
+    pub fn accept_all() -> WatchFilter {
+        WatchFilter(None)
+    }
+
+    /// A filter to limit the paths that get watched.
+    ///
+    /// Only directories for which `filter` returns `true` will be watched.
+    ///
+    /// The filter may be called on the thread that installed the watch (the root check, and
+    /// `PollWatcher`'s scans) or on a backend thread (directories discovered later, and event
+    /// delivery on FSEvents and Windows). It must not panic: where a panic surfaces, and
+    /// whether it is recoverable, differs by backend.
+    #[must_use]
+    pub fn with_filter(filter: impl Fn(&Path) -> bool + Send + Sync + 'static) -> WatchFilter {
+        WatchFilter(Some(Arc::new(filter)))
+    }
+
+    /// Returns whether this filter was created with [`WatchFilter::accept_all`].
+    ///
+    /// A filter built with [`WatchFilter::with_filter`] returns `false` even if its closure
+    /// always returns `true`; the two are not interchangeable, because re-watching a path is
+    /// only treated as a no-op when both the old and the new filter accept everything.
+    /// `Watcher` implementations use this to skip filtering work entirely.
+    #[must_use]
+    pub fn is_accept_all(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// Whether the directory at `path` may be watched.
+    ///
+    /// This is the check `Watcher` implementations (and `notify-debouncer-full`'s
+    /// `FileIdCache` implementations) should use when they encounter a directory; it is the
+    /// only one that implements the full directory-gating contract. When `path` is a symbolic
+    /// link, the filter is consulted for the resolved target as well, so a name-based
+    /// exclusion cannot be bypassed by reaching the directory through a link. A link whose
+    /// target cannot be resolved is rejected, since the filter cannot be asked about it.
+    ///
+    /// `path` should be absolute, since that is the form the filter is documented to receive.
+    #[must_use]
+    pub fn allows_dir(&self, path: &Path) -> bool {
+        if self.is_accept_all() {
+            // Skip the filter and the extra syscalls entirely: unfiltered watches must not
+            // pay filtering costs.
+            return true;
+        }
+        let is_symlink =
+            std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
+        self.allows_dir_with_symlink_hint(path, is_symlink)
+    }
+
+    /// [`WatchFilter::allows_dir`] for callers that already know whether `path` is a symbolic
+    /// link, such as a `walkdir` traversal (`DirEntry::path_is_symlink`), so the check costs
+    /// no extra syscall per directory.
+    pub(crate) fn allows_dir_with_symlink_hint(&self, path: &Path, is_symlink: bool) -> bool {
+        if self.is_accept_all() {
+            return true;
+        }
+        if !self.should_watch(path) {
+            return false;
+        }
+        if is_symlink {
+            // Fail closed: if the target cannot be resolved, the filter cannot be asked about
+            // it, and accepting would let an exclusion be bypassed through a link the caller
+            // happens to lack access to.
+            return match std::fs::canonicalize(path) {
+                Ok(target) => self.should_watch(&target),
+                Err(_) => false,
+            };
+        }
+        true
+    }
+
+    /// Returns whether `path` passes this filter, with no symlink resolution.
+    ///
+    /// Always returns `true` for [`WatchFilter::accept_all`]. Callers gating a directory on
+    /// disk want [`WatchFilter::allows_dir`] instead; this is for paths that are already
+    /// resolved, such as the ancestors of an event path.
+    pub(crate) fn should_watch(&self, path: &Path) -> bool {
+        self.0.as_ref().is_none_or(|filter| filter(path))
+    }
+}
+
 /// Type that can deliver file activity notifications
 ///
 /// `Watcher` is implemented per platform using the best implementation available on that platform.
@@ -399,7 +506,92 @@ pub trait Watcher {
     ///
     /// [#165]: https://github.com/notify-rs/notify/issues/165
     /// [#166]: https://github.com/notify-rs/notify/issues/166
-    fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()>;
+    fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
+        self.watch_filtered(path, recursive_mode, WatchFilter::accept_all())
+    }
+
+    /// Begin watching a new path, excluding directories rejected by `watch_filter`.
+    ///
+    /// Behaves like [`Watcher::watch`], except that directories for which `watch_filter`
+    /// returns `false` are not watched: recursive scans do not descend into them, directories
+    /// discovered later (e.g. created under a recursive watch) are checked against the filter
+    /// before being watched, and events beneath rejected directories are suppressed. Events for
+    /// non-directory children of an accepted directory are always delivered. Events for an
+    /// excluded directory itself may still be reported by a watched parent (for example, its
+    /// creation or removal), but events beneath that directory are suppressed.
+    ///
+    /// # Paths the filter receives
+    ///
+    /// The filter is always called with an absolute path, but not a normalized one: a relative
+    /// `path` is made absolute by joining it to the current directory, so `.` and `..`
+    /// components survive. Prefer matching on [`Path::file_name`] or on [`Path::components`]
+    /// over comparing whole paths, and never compare against a path relative to the watch root.
+    ///
+    /// Two backends resolve further: FSEvents (macOS) canonicalizes, so the filter sees
+    /// `/private/tmp` rather than `/tmp` and a symlinked directory only ever as its target.
+    /// `PollWatcher` and the `macos_kqueue` backend do not canonicalize, including on macOS. On
+    /// Windows the filter sees the path in whatever form it was resolved to, independent of
+    /// [`Config::with_windows_path_separator_style`], which affects only reported event paths.
+    ///
+    /// The filter only applies to directories: watching a non-directory `path` is never
+    /// affected by the filter.
+    ///
+    /// # Errors
+    ///
+    /// Violating either restriction below returns an error and leaves all watches
+    /// unchanged:
+    ///
+    /// - Watching a directory the filter itself rejects returns
+    ///   [`ErrorKind::PathExcluded`]. A `path` that is a symlink to a directory is checked
+    ///   against both the link path and its resolved target, except on FSEvents, which
+    ///   canonicalizes first and so only ever sees the target.
+    /// - A directory watch carrying a filter must not overlap another directory watch in
+    ///   either direction; filters are never merged across watches. This is reported as
+    ///   [`ErrorKind::WatchOverlap`], and it can be returned by plain [`Watcher::watch`] too,
+    ///   when the watch it would overlap is a filtered one. Watches whose filters are all
+    ///   [`WatchFilter::accept_all`] may overlap as before, file watches never conflict, and
+    ///   re-watching the same `path` replaces that watch as usual. To observe a region inside
+    ///   a filtered subtree, use a separate `Watcher` instance.
+    ///
+    /// A registered watch reserves its region for as long as it stays registered. Backends
+    /// that drop a watch when its directory is deleted (inotify, kqueue, Windows) release the
+    /// region at that point; `PollWatcher` and FSEvents keep the entry until it is explicitly
+    /// unwatched.
+    ///
+    /// Backend notes: inotify, kqueue and `PollWatcher` apply the filter while walking, so it
+    /// is called once per directory encountered. FSEvents (macOS) and ReadDirectoryChangesW
+    /// (Windows) cannot selectively watch directories: the kernel reports the whole subtree and
+    /// the filter is applied to event paths at delivery time with equivalent semantics (an
+    /// event is suppressed when a strict ancestor below the watch root is rejected). On those
+    /// two backends the filter is therefore called once per ancestor per event, on a backend
+    /// thread, so keep it cheap and free of blocking work.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use notify::{RecursiveMode, WatchFilter, Watcher};
+    /// use std::path::Path;
+    ///
+    /// # fn main() -> notify::Result<()> {
+    /// let mut watcher = notify::recommended_watcher(|_res| {})?;
+    /// // The filter is called with absolute paths even though the watch root is relative,
+    /// // so match on the file name rather than on a path relative to the root.
+    /// watcher.watch_filtered(
+    ///     Path::new("."),
+    ///     RecursiveMode::Recursive,
+    ///     WatchFilter::with_filter(|path: &Path| {
+    ///         path.file_name() != Some(std::ffi::OsStr::new(".git"))
+    ///     }),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn watch_filtered(
+        &mut self,
+        path: &Path,
+        recursive_mode: RecursiveMode,
+        watch_filter: WatchFilter,
+    ) -> Result<()>;
 
     /// Stop watching a path.
     ///
@@ -578,13 +770,82 @@ mod tests {
 
     use super::{
         Config, Error, ErrorKind, Event, NullWatcher, PathOp, PollWatcher, RecommendedWatcher,
-        RecursiveMode, Result, StdResult, WatchPathConfig, Watcher, WatcherKind,
+        RecursiveMode, Result, StdResult, WatchFilter, WatchPathConfig, Watcher, WatcherKind,
     };
     use crate::test::*;
 
     #[test]
     fn test_object_safe() {
         let _watcher: &dyn Watcher = &NullWatcher;
+    }
+
+    #[test]
+    fn watch_filter_accept_all_accepts_everything() {
+        let filter = WatchFilter::accept_all();
+        assert!(filter.is_accept_all());
+        assert!(filter.allows_dir(Path::new("/any/path")));
+    }
+
+    #[test]
+    fn watch_filter_applies_closure() {
+        let filter = reject_name("excluded");
+        assert!(!filter.is_accept_all());
+        assert!(filter.allows_dir(Path::new("/root/included")));
+        assert!(!filter.allows_dir(Path::new("/root/excluded")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_filter_allows_dir_checks_symlink_target() {
+        let dir = tempdir().unwrap();
+        let excluded = dir.path().join("excluded");
+        let alias = dir.path().join("alias");
+        fs::create_dir(&excluded).unwrap();
+        std::os::unix::fs::symlink(&excluded, &alias).unwrap();
+
+        let filter = reject_name("excluded");
+        assert!(
+            !filter.allows_dir(&alias),
+            "a symlink to an excluded directory must be rejected"
+        );
+        assert!(
+            !filter.allows_dir_with_symlink_hint(&alias, true),
+            "the hint-taking form must reject it too"
+        );
+        assert!(
+            filter.allows_dir_with_symlink_hint(&alias, false),
+            "a caller that says the path is not a link only gets the link path checked"
+        );
+        assert!(
+            WatchFilter::accept_all().allows_dir(&alias),
+            "accept-all must not pay for symlink resolution"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_filter_allows_dir_rejects_an_unresolvable_link() {
+        let dir = tempdir().unwrap();
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("missing"), &dangling).unwrap();
+
+        // The target cannot be resolved, so the filter cannot be asked about it. Every other
+        // error path in the feature rejects; accepting here would let an exclusion be
+        // bypassed through a link whose target the caller cannot resolve.
+        assert!(
+            !reject_name("excluded").allows_dir(&dangling),
+            "a link whose target cannot be resolved must be rejected"
+        );
+        assert!(
+            WatchFilter::accept_all().allows_dir(&dangling),
+            "accept-all still accepts everything"
+        );
+    }
+
+    #[test]
+    fn watch_filter_debug_names_the_type() {
+        assert!(format!("{:?}", WatchFilter::accept_all()).contains("WatchFilter"));
+        assert!(format!("{:?}", WatchFilter::with_filter(|_: &Path| true)).contains("WatchFilter"));
     }
 
     #[test]

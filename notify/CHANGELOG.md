@@ -2,6 +2,8 @@
 
 ## unreleased
 
+- CHANGE: add `ErrorKind::PathExcluded` and `ErrorKind::WatchOverlap`, reported when a watch is refused because its own filter rejects the directory, or because a filtered directory watch would overlap another one. `ErrorKind` is not `#[non_exhaustive]`, so an exhaustive `match` over it must be updated **breaking**
+- CHANGE: `Watcher::watch_filtered` is now the required `Watcher` trait method; `Watcher::watch` is a provided method that forwards to it with `WatchFilter::accept_all()`. Implementors of `Watcher` must implement `watch_filtered` instead of `watch` **breaking**
 - FEATURE: [FreeBSD] select native inotify automatically when building on FreeBSD 15.0+ and kqueue otherwise. The `freebsd_inotify` feature enables inotify when cross-compiling for FreeBSD 15.0+.
 - DEPS: bump `inotify` to 0.11.4 for native FreeBSD support
 - FEATURE: [macOS] add `Config::with_fsevent_latency` to configure FSEvents stream latency [#930]
@@ -13,6 +15,7 @@
 - FEATURE: [windows] report created file/folder kinds when they can be determined [#935]
 - CHANGE: [macOS] improve FSEvents callback performance by avoiding unnecessary allocations and repeated handler locking
 - PERF: [kqueue] avoid filesystem walks for recursive kqueue unwatch
+- FIX: never abandon a recursive watch, report what failed instead
 
 [#930]: https://github.com/notify-rs/notify/pull/930
 [#935]: https://github.com/notify-rs/notify/issues/935

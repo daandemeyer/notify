@@ -5,7 +5,7 @@
 //! will return events for the directory itself, and for files inside the directory.
 
 use super::event::*;
-use super::{Config, Error, ErrorKind, EventHandler, RecursiveMode, Result, Watcher};
+use super::{Config, Error, ErrorKind, EventHandler, RecursiveMode, Result, WatchFilter, Watcher};
 use crate::paths::{
     absolute_path, is_preserved_watch_root, preserved_watch_mode, preserved_watch_roots,
     recursive_user_watch_ancestor, reported_path, WatchMetadata, WatchPath,
@@ -575,12 +575,13 @@ impl EventLoop {
 
         for path in add_watches {
             if let Err(add_watch_error) = self.add_watch(path, true, false) {
-                // The handler should be notified if we have reached the limit.
+                // The handler should be notified of every failure, not just the limit.
                 // Otherwise, the user might expect that a recursive watch
                 // is continuing to work correctly, but it's not.
-                if let ErrorKind::MaxFilesWatch = add_watch_error.kind {
-                    self.event_handler.handle_event(Err(add_watch_error));
+                let reached_limit = matches!(add_watch_error.kind, ErrorKind::MaxFilesWatch);
+                self.event_handler.handle_event(Err(add_watch_error));
 
+                if reached_limit {
                     // After that kind of a error we should stop adding watches,
                     // because the limit has already reached and all next calls
                     // will return us only the same error.
@@ -593,6 +594,7 @@ impl EventLoop {
     fn add_watch(&mut self, path: WatchPath, is_recursive: bool, watch_self: bool) -> Result<()> {
         let path_is_dir = metadata(&path.absolute).map_err(Error::io_watch)?.is_dir();
         let requested_is_recursive = is_recursive && path_is_dir;
+        let mut inherited_recursive_root = None;
         if watch_self {
             if let Some(watch) = self
                 .watches
@@ -609,7 +611,7 @@ impl EventLoop {
                 // instead of merging with the previous metadata. If the current entry also carries
                 // recursive coverage from an ancestor, remember that ancestor before removal so we
                 // can rebuild that inherited coverage below.
-                let inherited_recursive_root =
+                inherited_recursive_root =
                     if !requested_is_recursive && path_is_dir && watch.metadata.is_recursive {
                         recursive_user_watch_ancestor(
                             &path.absolute,
@@ -620,42 +622,45 @@ impl EventLoop {
                     } else {
                         None
                     };
-                let replaced_path = path.absolute.clone();
-                self.remove_watch(replaced_path.clone(), false)?;
-
-                if let Some((ancestor_path, ancestor_reported_path)) = inherited_recursive_root {
-                    // Removing a directory watch removes its recursively inherited children too.
-                    // Re-add them as non-user watches so the ancestor recursive watch still covers
-                    // this subtree after the user watch is replaced.
-                    let entries = WalkDir::new(&replaced_path)
-                        .follow_links(self.follow_links)
-                        .into_iter()
-                        .filter_map(filter_dir)
-                        .map(|entry| {
-                            let absolute = entry.into_path();
-                            let requested =
-                                reported_path(&ancestor_path, &ancestor_reported_path, &absolute);
-                            WatchPath::from_parts(absolute, requested)
-                        });
-                    self.add_watches_for_paths(entries, true, false)?;
-                }
+                self.remove_watch(path.absolute.clone(), false)?;
             }
         }
 
-        // If the watch is not recursive, or if we determine (by stat'ing the path to get its
-        // metadata) that the watched path is not a directory, add a single path watch.
         if !requested_is_recursive {
-            return self.add_single_watch(path, false, true);
+            // If the watch is not recursive, or if we determine (by stat'ing the path to get its
+            // metadata) that the watched path is not a directory, add a single path watch.
+            self.add_single_watch(path.clone(), false, true)?;
+        } else {
+            let root = path.clone();
+            let entries = WalkDir::new(&root.absolute)
+                .follow_links(self.follow_links)
+                .into_iter()
+                .filter_map(filter_dir)
+                .map(move |entry| root.child(entry.into_path()));
+
+            self.add_watches_for_paths(entries, is_recursive, watch_self)?;
         }
 
-        let root = path.clone();
-        let entries = WalkDir::new(&root.absolute)
-            .follow_links(self.follow_links)
-            .into_iter()
-            .filter_map(filter_dir)
-            .map(move |entry| root.child(entry.into_path()));
+        if let Some((ancestor_path, ancestor_reported_path)) = inherited_recursive_root {
+            // Removing a directory watch removes its recursively inherited children too. Re-add
+            // them as non-user watches so the ancestor recursive watch still covers this subtree
+            // after the user watch is replaced. This runs after the replacement watch is
+            // installed, so the explicit entry owns its own metadata and the rebuilt children
+            // merge inherited coverage on top of it rather than being overwritten by it.
+            let entries = WalkDir::new(&path.absolute)
+                .follow_links(self.follow_links)
+                .into_iter()
+                .filter_map(filter_dir)
+                .map(move |entry| {
+                    let absolute = entry.into_path();
+                    let requested =
+                        reported_path(&ancestor_path, &ancestor_reported_path, &absolute);
+                    WatchPath::from_parts(absolute, requested)
+                });
+            self.add_watches_for_paths(entries, true, false)?;
+        }
 
-        self.add_watches_for_paths(entries, is_recursive, watch_self)
+        Ok(())
     }
 
     fn add_watches_for_paths<I>(
@@ -670,10 +675,14 @@ impl EventLoop {
         for path in paths {
             match self.add_single_watch(path, is_recursive, watch_self) {
                 Ok(()) => {}
+                // The requested path itself failing is the caller's problem.
+                Err(err) if watch_self => return Err(err),
                 // TOCTOU: a subdirectory can disappear between walkdir listing it and us adding an
                 // inotify watch for it. This should not fail the overall recursive watch call.
-                Err(err) if !watch_self && matches!(err.kind, ErrorKind::PathNotFound) => {}
-                Err(err) => return Err(err),
+                Err(err) if matches!(err.kind, ErrorKind::PathNotFound) => {}
+                // Neither should anything else: returning would leave every directory the walk has
+                // not reached yet unwatched, with nothing to notice. Report it and carry on.
+                Err(err) => self.event_handler.handle_event(Err(err)),
             }
             watch_self = false;
         }
@@ -727,24 +736,12 @@ impl EventLoop {
                             return Err(Error::io_watch(e).add_path(path.requested));
                         }
                     };
-                    let metadata = if let Some(existing_watch) = existing_watch {
-                        WatchMetadata::new(
-                            &path,
-                            is_recursive,
-                            watch_self,
-                            Some(&existing_watch.metadata),
-                            self.watches
-                                .iter()
-                                .map(|(path, watch)| (path, &watch.metadata)),
-                        )
-                    } else {
-                        WatchMetadata {
-                            is_recursive,
-                            reported_path: path.requested.clone(),
-                            is_user_watch: watch_self,
-                            user_is_recursive: watch_self && is_recursive,
-                        }
-                    };
+                    let metadata = WatchMetadata::new(
+                        &path,
+                        is_recursive,
+                        watch_self,
+                        existing_watch.map(|watch| &watch.metadata),
+                    );
 
                     self.watches.insert(
                         path.absolute.clone(),
@@ -970,7 +967,19 @@ impl Watcher for INotifyWatcher {
         Self::from_event_handler(Box::new(event_handler), &config)
     }
 
-    fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
+    fn watch_filtered(
+        &mut self,
+        path: &Path,
+        recursive_mode: RecursiveMode,
+        watch_filter: WatchFilter,
+    ) -> Result<()> {
+        if !watch_filter.is_accept_all() {
+            // Filtering is not implemented for this backend yet. Refuse rather than
+            // silently watching more than the caller asked for.
+            return Err(Error::generic(
+                "this watcher does not support watch filters yet",
+            ));
+        }
         self.watch_inner(path, recursive_mode)
     }
 
@@ -1092,6 +1101,139 @@ mod tests {
         assert!(
             result.is_ok(),
             "expected recursive watch to succeed, got: {result:?}"
+        );
+    }
+
+    /// Create a directory `inotify_add_watch` refuses; false if it stayed readable
+    /// (happens when running as root)
+    fn unwatchable_dir(path: &Path) -> bool {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::create_dir(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::read_dir(path).is_err()
+    }
+
+    /// Undo `unwatchable_dir`, so that the tempdir can be removed again.
+    fn make_readable(path: &Path) {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Wait for an event the predicate accepts.
+    fn wait_for(
+        rx: &mpsc::Receiver<Result<Event>>,
+        accept: impl Fn(&Result<Event>) -> bool,
+    ) -> Option<Result<Event>> {
+        use std::time::Instant;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(event) = rx.recv_timeout(Duration::from_millis(200)) {
+                if accept(&event) {
+                    return Some(event);
+                }
+            }
+        }
+        None
+    }
+
+    /// A directory that cannot be watched must not cause the later ones to get ignored.
+    #[test]
+    fn recursive_watch_survives_an_unwatchable_subdir() {
+        use std::fs;
+        use std::sync::Mutex;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().to_path_buf();
+        let unwatchable = root.join("unwatchable");
+        let readable = root.join("readable");
+        let deeper = readable.join("deeper");
+        fs::create_dir_all(&deeper).unwrap();
+        if !unwatchable_dir(&unwatchable) {
+            return; // running as root, which can watch a directory it cannot read
+        }
+
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let collected = errors.clone();
+        let inotify = super::inotify_sys::Inotify::init().unwrap();
+        let mut event_loop = EventLoop::new(
+            inotify,
+            Box::new(move |event: Result<Event>| {
+                if let Err(e) = event {
+                    collected.lock().unwrap().push(e);
+                }
+            }),
+            &Config::default(),
+        )
+        .unwrap();
+
+        let result = event_loop.add_watch(WatchPath::new(&root).unwrap(), true, true);
+        // Before the asserts: a directory the test cannot read is one tempfile cannot remove.
+        make_readable(&unwatchable);
+
+        assert!(
+            result.is_ok(),
+            "expected the watch to succeed, got: {result:?}"
+        );
+        assert!(event_loop.watches.contains_key(&readable));
+        assert!(event_loop.watches.contains_key(&deeper));
+        let errors = errors.lock().unwrap();
+        assert!(
+            errors.iter().any(|e| e.paths.contains(&unwatchable)),
+            "expected the unwatchable directory to be reported, got: {errors:?}"
+        );
+    }
+
+    /// The same when the directory appears later: the failure has to reach the handler.
+    #[test]
+    fn watch_failure_after_a_directory_appears_is_reported() {
+        use std::fs;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().join("root");
+        let staging = tmpdir.path().join("staging");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir_all(staging.join("readable")).unwrap();
+        if !unwatchable_dir(&staging.join("unwatchable")) {
+            return; // running as root, which can watch a directory it cannot read
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = INotifyWatcher::new(
+            move |event| {
+                let _ = tx.send(event);
+            },
+            Config::default(),
+        )
+        .unwrap();
+        watcher.watch(&root, RecursiveMode::Recursive).unwrap();
+
+        // Moved in whole, so the walk it triggers is certain to meet the unwatchable directory.
+        let appearing = root.join("appearing");
+        fs::rename(&staging, &appearing).unwrap();
+
+        let reported = wait_for(&rx, Result::is_err);
+        make_readable(&appearing.join("unwatchable"));
+        let reported = reported
+            .expect("expected the unwatchable directory to be reported")
+            .unwrap_err();
+        assert!(
+            reported.paths.iter().any(|p| p.ends_with("unwatchable")),
+            "expected the unwatchable directory to be named, got: {reported:?}"
+        );
+
+        // Its sibling is watched, so changes under it are still reported.
+        fs::write(appearing.join("readable").join("file"), "x").unwrap();
+        assert!(
+            wait_for(&rx, |event| {
+                matches!(event, Ok(event) if event.paths.iter().any(|p| p.ends_with("file")))
+            })
+            .is_some(),
+            "expected a change under the sibling directory to be reported"
         );
     }
 
