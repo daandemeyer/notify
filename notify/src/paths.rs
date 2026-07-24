@@ -1,7 +1,3 @@
-// Everything this module gains here is consumed by the per-backend commits that follow,
-// so none of it has a caller yet at this point in the series.
-#![allow(dead_code)]
-
 use crate::{Error, Result, WatchFilter};
 use std::{
     env,

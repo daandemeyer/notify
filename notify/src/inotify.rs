@@ -7,8 +7,9 @@
 use super::event::*;
 use super::{Config, Error, ErrorKind, EventHandler, RecursiveMode, Result, WatchFilter, Watcher};
 use crate::paths::{
-    absolute_path, is_preserved_watch_root, preserved_watch_mode, preserved_watch_roots,
-    recursive_user_watch_ancestor, reported_path, WatchMetadata, WatchPath,
+    absolute_path, check_watch_barriers, filter_keeps_walk_entry, is_preserved_watch_root,
+    preserved_watch_mode, preserved_watch_roots, recursive_user_watch_ancestor, reported_path,
+    WatchMetadata, WatchPath,
 };
 use crate::{bounded, unbounded, BoundSender, Receiver, Sender};
 use inotify as inotify_sys;
@@ -100,7 +101,6 @@ struct EventLoop {
 struct Watch {
     watch_descriptor: WatchDescriptor,
     watch_mask: WatchMask,
-    is_dir: bool,
     metadata: WatchMetadata,
 }
 
@@ -112,7 +112,7 @@ pub struct INotifyWatcher {
 }
 
 enum EventLoopMsg {
-    AddWatch(WatchPath, RecursiveMode, Sender<Result<()>>),
+    AddWatch(WatchPath, RecursiveMode, WatchFilter, Sender<Result<()>>),
     RemoveWatch(PathBuf, Sender<Result<()>>),
     GetWatchedPaths(Sender<Vec<(PathBuf, RecursiveMode)>>),
     Shutdown,
@@ -124,15 +124,18 @@ fn add_watch_by_event(
     path: &PathBuf,
     event: &inotify_sys::Event<&OsStr>,
     watches: &HashMap<PathBuf, Watch>,
-    add_watches: &mut Vec<WatchPath>,
+    add_watches: &mut Vec<(WatchPath, WatchFilter)>,
 ) {
     if event.mask.contains(EventMask::ISDIR) {
         if let Some(parent_path) = path.parent() {
             if let Some(watch) = watches.get(parent_path) {
                 if watch.metadata.is_recursive {
-                    add_watches.push(WatchPath::from_parts(
-                        path.to_owned(),
-                        reported_path(parent_path, &watch.metadata.reported_path, path),
+                    add_watches.push((
+                        WatchPath::from_parts(
+                            path.to_owned(),
+                            reported_path(parent_path, &watch.metadata.reported_path, path),
+                        ),
+                        watch.metadata.watch_filter.clone(),
                     ));
                 }
             }
@@ -258,8 +261,13 @@ impl EventLoop {
     fn handle_messages(&mut self) {
         while let Ok(msg) = self.event_loop_rx.try_recv() {
             match msg {
-                EventLoopMsg::AddWatch(path, recursive_mode, tx) => {
-                    let _ = tx.send(self.add_watch(path, recursive_mode.is_recursive(), true));
+                EventLoopMsg::AddWatch(path, recursive_mode, watch_filter, tx) => {
+                    let _ = tx.send(self.add_watch(
+                        path,
+                        recursive_mode.is_recursive(),
+                        true,
+                        watch_filter,
+                    ));
                 }
                 EventLoopMsg::RemoveWatch(path, tx) => {
                     let _ = tx.send(self.remove_watch(path, false));
@@ -458,7 +466,7 @@ impl EventLoop {
                             }
                             if event.mask.contains(EventMask::DELETE_SELF) {
                                 let remove_kind = match self.watches.get(&path) {
-                                    Some(watch) if watch.is_dir => RemoveKind::Folder,
+                                    Some(watch) if watch.metadata.is_dir => RemoveKind::Folder,
                                     Some(_) => RemoveKind::File,
                                     None => RemoveKind::Other,
                                 };
@@ -573,8 +581,8 @@ impl EventLoop {
             }
         }
 
-        for path in add_watches {
-            if let Err(add_watch_error) = self.add_watch(path, true, false) {
+        for (path, watch_filter) in add_watches {
+            if let Err(add_watch_error) = self.add_watch(path, true, false, watch_filter) {
                 // The handler should be notified of every failure, not just the limit.
                 // Otherwise, the user might expect that a recursive watch
                 // is continuing to work correctly, but it's not.
@@ -591,18 +599,47 @@ impl EventLoop {
         }
     }
 
-    fn add_watch(&mut self, path: WatchPath, is_recursive: bool, watch_self: bool) -> Result<()> {
+    #[cfg(test)]
+    fn add_watch_unfiltered(
+        &mut self,
+        path: WatchPath,
+        is_recursive: bool,
+        watch_self: bool,
+    ) -> Result<()> {
+        self.add_watch(path, is_recursive, watch_self, WatchFilter::accept_all())
+    }
+
+    fn add_watch(
+        &mut self,
+        path: WatchPath,
+        is_recursive: bool,
+        watch_self: bool,
+        watch_filter: WatchFilter,
+    ) -> Result<()> {
         let path_is_dir = metadata(&path.absolute).map_err(Error::io_watch)?.is_dir();
         let requested_is_recursive = is_recursive && path_is_dir;
         let mut inherited_recursive_root = None;
         if watch_self {
+            check_watch_barriers(
+                &path.absolute,
+                &path.requested,
+                path_is_dir,
+                requested_is_recursive,
+                &watch_filter,
+                self.watches
+                    .iter()
+                    .filter(|(_, watch)| watch.metadata.is_user_watch)
+                    .map(|(path, watch)| watch.metadata.summary(path)),
+            )?;
+
             if let Some(watch) = self
                 .watches
                 .get(&path.absolute)
                 .filter(|watch| watch.metadata.is_user_watch)
             {
-                if watch.metadata.user_is_recursive == requested_is_recursive
-                    && watch.metadata.reported_path == path.requested
+                if watch
+                    .metadata
+                    .rewatch_is_noop(&path, requested_is_recursive, &watch_filter)
                 {
                     return Ok(());
                 }
@@ -629,16 +666,19 @@ impl EventLoop {
         if !requested_is_recursive {
             // If the watch is not recursive, or if we determine (by stat'ing the path to get its
             // metadata) that the watched path is not a directory, add a single path watch.
-            self.add_single_watch(path.clone(), false, true)?;
+            self.add_single_watch(path.clone(), false, true, watch_filter)?;
         } else {
             let root = path.clone();
+            let filter = watch_filter.clone();
             let entries = WalkDir::new(&root.absolute)
                 .follow_links(self.follow_links)
                 .into_iter()
+                // Prune rejected directories: don't watch them and don't descend into them.
+                .filter_entry(move |entry| filter_keeps_walk_entry(&filter, entry))
                 .filter_map(filter_dir)
                 .map(move |entry| root.child(entry.into_path()));
 
-            self.add_watches_for_paths(entries, is_recursive, watch_self)?;
+            self.add_watches_for_paths(entries, is_recursive, watch_self, watch_filter)?;
         }
 
         if let Some((ancestor_path, ancestor_reported_path)) = inherited_recursive_root {
@@ -657,7 +697,9 @@ impl EventLoop {
                         reported_path(&ancestor_path, &ancestor_reported_path, &absolute);
                     WatchPath::from_parts(absolute, requested)
                 });
-            self.add_watches_for_paths(entries, true, false)?;
+            // The overlap barrier guarantees such an ancestor is unfiltered, so the rebuilt
+            // subtree needs no filter gating.
+            self.add_watches_for_paths(entries, true, false, WatchFilter::accept_all())?;
         }
 
         Ok(())
@@ -668,12 +710,13 @@ impl EventLoop {
         paths: I,
         is_recursive: bool,
         mut watch_self: bool,
+        watch_filter: WatchFilter,
     ) -> Result<()>
     where
         I: IntoIterator<Item = WatchPath>,
     {
         for path in paths {
-            match self.add_single_watch(path, is_recursive, watch_self) {
+            match self.add_single_watch(path, is_recursive, watch_self, watch_filter.clone()) {
                 Ok(()) => {}
                 // The requested path itself failing is the caller's problem.
                 Err(err) if watch_self => return Err(err),
@@ -695,6 +738,7 @@ impl EventLoop {
         path: WatchPath,
         is_recursive: bool,
         watch_self: bool,
+        watch_filter: WatchFilter,
     ) -> Result<()> {
         // Build watch mask from configured event kinds for kernel-level filtering
         let mut watchmask = event_kind_mask_to_watch_mask(self.event_kind_mask, is_recursive);
@@ -736,15 +780,13 @@ impl EventLoop {
                             return Err(Error::io_watch(e).add_path(path.requested));
                         }
                     };
-                    // inotify does not implement filtering yet; it always records an
-                    // accept-all filter.
                     let metadata = WatchMetadata::new(
                         &path,
                         is_dir,
                         is_recursive,
                         watch_self,
                         existing_watch.map(|watch| &watch.metadata),
-                        WatchFilter::accept_all(),
+                        watch_filter,
                     );
 
                     self.watches.insert(
@@ -752,7 +794,6 @@ impl EventLoop {
                         Watch {
                             watch_descriptor: w.clone(),
                             watch_mask: watchmask,
-                            is_dir,
                             metadata,
                         },
                     );
@@ -937,10 +978,15 @@ impl INotifyWatcher {
         Ok(INotifyWatcher { channel, waker })
     }
 
-    fn watch_inner(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
+    fn watch_inner(
+        &mut self,
+        path: &Path,
+        recursive_mode: RecursiveMode,
+        watch_filter: WatchFilter,
+    ) -> Result<()> {
         let pb = WatchPath::new(path)?;
         let (tx, rx) = unbounded();
-        let msg = EventLoopMsg::AddWatch(pb, recursive_mode, tx);
+        let msg = EventLoopMsg::AddWatch(pb, recursive_mode, watch_filter, tx);
 
         self.channel.send(msg)?;
         self.waker.wake()?;
@@ -977,14 +1023,7 @@ impl Watcher for INotifyWatcher {
         recursive_mode: RecursiveMode,
         watch_filter: WatchFilter,
     ) -> Result<()> {
-        if !watch_filter.is_accept_all() {
-            // Filtering is not implemented for this backend yet. Refuse rather than
-            // silently watching more than the caller asked for.
-            return Err(Error::generic(
-                "this watcher does not support watch filters yet",
-            ));
-        }
-        self.watch_inner(path, recursive_mode)
+        self.watch_inner(path, recursive_mode, watch_filter)
     }
 
     fn unwatch(&mut self, path: &Path) -> Result<()> {
@@ -1027,7 +1066,7 @@ mod tests {
     use super::inotify_sys::WatchMask;
     use super::{
         Config, Error, ErrorKind, Event, EventKind, EventLoop, INotifyWatcher, RecursiveMode,
-        Result, WatchPath, Watcher,
+        Result, WatchFilter, WatchPath, Watcher,
     };
     use notify_types::event::{EventKindMask, RemoveKind};
 
@@ -1101,6 +1140,7 @@ mod tests {
                 .map(|path| WatchPath::new(&path).unwrap()),
             true,
             true,
+            WatchFilter::accept_all(),
         );
         assert!(
             result.is_ok(),
@@ -1175,7 +1215,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = event_loop.add_watch(WatchPath::new(&root).unwrap(), true, true);
+        let result = event_loop.add_watch_unfiltered(WatchPath::new(&root).unwrap(), true, true);
         // Before the asserts: a directory the test cannot read is one tempfile cannot remove.
         make_readable(&unwatchable);
 
@@ -1242,6 +1282,272 @@ mod tests {
     }
 
     #[test]
+    fn watch_filter_prunes_excluded_directories() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().to_path_buf();
+        let excluded = root.join("excluded");
+        let excluded_sub = excluded.join("sub");
+        let included = root.join("included");
+        std::fs::create_dir_all(&excluded_sub).unwrap();
+        std::fs::create_dir_all(&included).unwrap();
+
+        let mut event_loop = test_event_loop();
+
+        event_loop
+            .add_watch(
+                WatchPath::new(&root).unwrap(),
+                true,
+                true,
+                reject_name("excluded"),
+            )
+            .expect("watch recursively");
+
+        assert!(event_loop.watches.contains_key(&root));
+        assert!(event_loop.watches.contains_key(&included));
+        assert!(!event_loop.watches.contains_key(&excluded));
+        assert!(
+            !event_loop.watches.contains_key(&excluded_sub),
+            "descent into excluded directories must be pruned"
+        );
+    }
+
+    #[test]
+    fn rewatch_with_different_filter_rebuilds_watch() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().to_path_buf();
+        let excluded = root.join("excluded");
+        std::fs::create_dir_all(&excluded).unwrap();
+
+        let mut event_loop = test_event_loop();
+
+        event_loop
+            .add_watch(
+                WatchPath::new(&root).unwrap(),
+                true,
+                true,
+                reject_name("excluded"),
+            )
+            .expect("watch recursively with filter");
+        assert!(!event_loop.watches.contains_key(&excluded));
+
+        // Re-watching with a different filter (here: accept-all, i.e. plain `watch()`) must
+        // rebuild the watch instead of short-circuiting as unchanged.
+        event_loop
+            .add_watch_unfiltered(WatchPath::new(&root).unwrap(), true, true)
+            .expect("rewatch with accept-all");
+        assert!(
+            event_loop.watches.contains_key(&excluded),
+            "a rewatch with a different filter must take effect"
+        );
+    }
+
+    // A filtered watch is always rebuilt, even when the request looks identical, because two
+    // filters cannot be compared for behavioral equality.
+    #[test]
+    fn filtered_rewatch_always_rebuilds() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().to_path_buf();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+
+        let mut event_loop = test_event_loop();
+
+        event_loop
+            .add_watch(
+                WatchPath::new(&root).unwrap(),
+                true,
+                true,
+                reject_name("excluded"),
+            )
+            .expect("watch root");
+
+        // Created behind the event loop's back, so only a rebuild walk can discover it.
+        let newdir = root.join("newdir");
+        std::fs::create_dir(&newdir).unwrap();
+
+        event_loop
+            .add_watch(
+                WatchPath::new(&root).unwrap(),
+                true,
+                true,
+                reject_name("excluded"),
+            )
+            .expect("rewatch with an equivalent filter");
+        assert!(
+            event_loop.watches.contains_key(&newdir),
+            "a filtered rewatch must rebuild rather than short-circuit"
+        );
+    }
+
+    // An unfiltered rewatch that asks for exactly the current watch still short-circuits.
+    #[test]
+    fn identical_unfiltered_rewatch_is_noop() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().to_path_buf();
+
+        let mut event_loop = test_event_loop();
+
+        event_loop
+            .add_watch_unfiltered(WatchPath::new(&root).unwrap(), true, true)
+            .expect("watch root");
+
+        let newdir = root.join("newdir");
+        std::fs::create_dir(&newdir).unwrap();
+        event_loop
+            .add_watch_unfiltered(WatchPath::new(&root).unwrap(), true, true)
+            .expect("identical rewatch");
+        assert!(
+            !event_loop.watches.contains_key(&newdir),
+            "an identical unfiltered rewatch must be a no-op, not a rebuild"
+        );
+    }
+
+    #[test]
+    fn rejected_root_preserves_existing_watch() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().to_path_buf();
+        std::fs::create_dir_all(root.join("child")).unwrap();
+
+        let mut event_loop = test_event_loop();
+
+        event_loop
+            .add_watch_unfiltered(WatchPath::new(&root).unwrap(), true, true)
+            .expect("watch recursively");
+        let before = event_loop
+            .watches
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+
+        let rejecting = root.clone();
+        let result = event_loop.add_watch(
+            WatchPath::new(&root).unwrap(),
+            true,
+            true,
+            WatchFilter::with_filter(move |p: &std::path::Path| p != rejecting),
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(Error {
+                    kind: ErrorKind::PathExcluded,
+                    ..
+                })
+            ),
+            "watching a rejected root must fail with PathExcluded: {result:?}"
+        );
+        assert_eq!(
+            event_loop
+                .watches
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>(),
+            before,
+            "a failed rewatch must leave existing watches unchanged"
+        );
+    }
+
+    // A directory created under a recursive filtered watch must inherit that watch's filter,
+    // or the subtree below it is watched unfiltered and events leak out of directories the
+    // filter rejects. The initial-walk tests cannot catch this: the directory has to appear
+    // after the watch is installed, so that runtime discovery is what registers it.
+    #[test]
+    fn runtime_discovered_directory_inherits_the_filter() {
+        use crate::Watcher;
+        use std::time::{Duration, Instant};
+
+        let tmpdir = testdir();
+        let root = tmpdir.path();
+
+        let (mut watcher, mut rx) = watcher();
+        watcher
+            .watcher
+            .watch_filtered(root, RecursiveMode::Recursive, reject_name("excluded"))
+            .expect("watch filtered");
+
+        // Discovered at runtime, so it is registered by the event loop rather than the walk.
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).expect("create sub");
+        rx.wait_unordered([expected(&sub).create_folder()]);
+
+        // If `sub` inherited an accept-all filter, `excluded` gets watched and the writes
+        // below are delivered.
+        let excluded = sub.join("excluded");
+        let sibling = sub.join("kept");
+        std::fs::create_dir(&excluded).expect("create excluded");
+        std::fs::create_dir(&sibling).expect("create kept");
+
+        // The watch on a directory is installed just after its create event is emitted, so a
+        // single write can race ahead of it. Keep writing to both until the sibling's file is
+        // observed, asserting throughout that nothing inside the excluded directory ever is.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut saw_sibling = false;
+        let assert_no_leak = |event: &crate::Event| {
+            assert!(
+                !event
+                    .paths
+                    .iter()
+                    .any(|p| p.starts_with(&excluded) && *p != excluded),
+                "the discovered directory did not inherit the filter: {event:?}"
+            );
+        };
+        while !saw_sibling && Instant::now() < deadline {
+            std::fs::write(excluded.join("hidden.txt"), "x").expect("write hidden");
+            std::fs::write(sibling.join("seen.txt"), "x").expect("write seen");
+
+            // Drain the whole batch rather than stopping at the first sibling event: a leaked
+            // event can be queued behind it, and stopping early would never inspect it.
+            let attempt_deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < attempt_deadline {
+                match rx.rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(Ok(event)) => {
+                        assert_no_leak(&event);
+                        saw_sibling |= event.paths.iter().any(|p| p.ends_with("seen.txt"));
+                    }
+                    Ok(Err(e)) => panic!("watcher error: {e:?}"),
+                    Err(_) => {}
+                }
+            }
+        }
+        assert!(saw_sibling, "expected the sibling file event");
+
+        // Settle and drain anything still queued, so the no-leak assertion does not depend on
+        // delivery order.
+        std::thread::sleep(Duration::from_millis(300));
+        while let Ok(Ok(event)) = rx.rx.try_recv() {
+            assert_no_leak(&event);
+        }
+    }
+
+    #[test]
+    fn symlink_to_excluded_directory_is_pruned() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().to_path_buf();
+        let excluded = root.join("excluded");
+        std::fs::create_dir_all(&excluded).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&excluded, &link).unwrap();
+
+        // follow_symlinks defaults to true.
+        let mut event_loop = test_event_loop();
+
+        event_loop
+            .add_watch(
+                WatchPath::new(&root).unwrap(),
+                true,
+                true,
+                reject_name("excluded"),
+            )
+            .expect("watch recursively");
+
+        assert!(!event_loop.watches.contains_key(&excluded));
+        assert!(
+            !event_loop.watches.contains_key(&link),
+            "a symlink to an excluded directory must not be watched"
+        );
+    }
+
+    #[test]
     fn rewatching_same_path_replaces_recursive_state() {
         let tmpdir = tempfile::tempdir().unwrap();
         let root = tmpdir.path().to_path_buf();
@@ -1251,12 +1557,12 @@ mod tests {
         let mut event_loop = test_event_loop();
 
         event_loop
-            .add_watch(WatchPath::new(&root).unwrap(), true, true)
+            .add_watch_unfiltered(WatchPath::new(&root).unwrap(), true, true)
             .expect("watch recursively");
         assert!(event_loop.watches.contains_key(&child));
 
         event_loop
-            .add_watch(WatchPath::new(&root).unwrap(), false, true)
+            .add_watch_unfiltered(WatchPath::new(&root).unwrap(), false, true)
             .expect("rewatch non-recursively");
 
         let watch = event_loop.watches.get(&root).expect("root watch");
@@ -1277,13 +1583,13 @@ mod tests {
         let mut event_loop = test_event_loop();
 
         event_loop
-            .add_watch(WatchPath::new(&root).unwrap(), true, true)
+            .add_watch_unfiltered(WatchPath::new(&root).unwrap(), true, true)
             .expect("watch root recursively");
         event_loop
-            .add_watch(WatchPath::new(&child).unwrap(), false, true)
+            .add_watch_unfiltered(WatchPath::new(&child).unwrap(), false, true)
             .expect("watch child non-recursively");
         event_loop
-            .add_watch(
+            .add_watch_unfiltered(
                 WatchPath::from_parts(child.clone(), PathBuf::from("reported-child")),
                 false,
                 true,
@@ -1318,16 +1624,16 @@ mod tests {
         let mut event_loop = test_event_loop();
 
         event_loop
-            .add_watch(WatchPath::new(&root).unwrap(), true, true)
+            .add_watch_unfiltered(WatchPath::new(&root).unwrap(), true, true)
             .expect("watch root recursively");
         event_loop
             .remove_watch(child.clone(), false)
             .expect("carve out child");
         event_loop
-            .add_watch(WatchPath::new(&child).unwrap(), false, true)
+            .add_watch_unfiltered(WatchPath::new(&child).unwrap(), false, true)
             .expect("watch child non-recursively");
         event_loop
-            .add_watch(
+            .add_watch_unfiltered(
                 WatchPath::from_parts(child.clone(), PathBuf::from("reported-child")),
                 false,
                 true,
@@ -1509,7 +1815,7 @@ mod tests {
         let config = Config::default().with_event_kinds(EventKindMask::MODIFY_DATA);
         let mut event_loop = test_event_loop_with_config(&config);
         event_loop
-            .add_watch(WatchPath::new(&root).unwrap(), true, true)
+            .add_watch_unfiltered(WatchPath::new(&root).unwrap(), true, true)
             .expect("watch recursively");
 
         let child_descriptor = event_loop
@@ -1539,7 +1845,7 @@ mod tests {
         let path = tmpdir.path().to_path_buf();
         let mut event_loop = test_event_loop();
         event_loop
-            .add_watch(WatchPath::new(&path).unwrap(), false, true)
+            .add_watch_unfiltered(WatchPath::new(&path).unwrap(), false, true)
             .expect("add_watch");
 
         // DELETE may queue a normal removal before DELETE_SELF or IGNORED confirms that the
@@ -1572,7 +1878,7 @@ mod tests {
         let config = Config::default().with_event_kinds(EventKindMask::MODIFY_DATA);
         let mut event_loop = test_event_loop_with_config(&config);
         event_loop
-            .add_watch(WatchPath::new(&root).unwrap(), true, true)
+            .add_watch_unfiltered(WatchPath::new(&root).unwrap(), true, true)
             .expect("watch recursively");
 
         let child_descriptor = event_loop
@@ -1624,7 +1930,7 @@ mod tests {
         let mut event_loop = test_event_loop();
 
         event_loop
-            .add_watch(WatchPath::new(&watched).unwrap(), false, true)
+            .add_watch_unfiltered(WatchPath::new(&watched).unwrap(), false, true)
             .expect("add_watch");
 
         event_loop
