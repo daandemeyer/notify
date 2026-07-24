@@ -245,6 +245,7 @@ fn request(
             separator_style: SeparatorStyle::Backslash,
             stopping: Arc::new(AtomicBool::new(false)),
             read_directory_changes_ex: extended.then_some(fail_extended_read),
+            watch_filter: crate::WatchFilter::accept_all(),
         },
         action_tx,
     });

@@ -1,5 +1,18 @@
-// The backends do not call the watch filter helpers yet.
-#![allow(dead_code)]
+// Only inotify and kqueue keep one entry for each watched path, in `WatchMetadata` and
+// `UserRoots`. The other backends leave those types and `WatchPath::child` unused.
+#![cfg_attr(
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+        target_os = "ios",
+        all(target_os = "macos", feature = "macos_kqueue")
+    )),
+    allow(dead_code)
+)]
 
 use crate::{Error, Result, WatchFilter};
 use std::{

@@ -744,7 +744,9 @@ pub trait Watcher {
     /// the whole subtree of a watch, and neither API accepts a filter function. On FSEvents and
     /// Windows, an event is dropped when the filter rejects a directory between the watch root
     /// and the event path. There the filter is called once for each of those directories on
-    /// every event, on a backend thread, so keep it cheap and free of blocking work.
+    /// every event, on a backend thread, so keep it cheap and free of blocking work. Windows
+    /// also drops a modification of a path that the filter rejects and that no longer exists,
+    /// because the backend cannot tell whether the path was a directory.
     ///
     /// This is a shorthand for [`Watcher::watch_with`] with
     /// [`WatchPathConfig::with_watch_filter`]. A `Watcher` that does not support filters
