@@ -695,6 +695,9 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
     /// # Ok(())
     /// # }
     /// ```
+    // The error intentionally carries the failed and unapplied `PathOp`s back to the caller,
+    // which makes it larger than clippy's default threshold.
+    #[allow(clippy::result_large_err)]
     pub fn update_paths<Op: Into<PathOp>>(
         &mut self,
         ops: impl IntoIterator<Item = Op>,

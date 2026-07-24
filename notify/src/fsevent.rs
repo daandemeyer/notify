@@ -370,6 +370,9 @@ impl FsEventWatcher {
         result
     }
 
+    // The error intentionally carries the failed and unapplied `PathOp`s back to the caller,
+    // which makes it larger than clippy's default threshold.
+    #[allow(clippy::result_large_err)]
     fn update_paths_inner(
         &mut self,
         ops: Vec<crate::PathOp>,

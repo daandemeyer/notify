@@ -2,6 +2,7 @@
 
 ## unreleased
 
+- FEATURE: add `WatchPathConfig::with_watch_filter` so `Watcher::update_paths` batches can carry a `WatchFilter` per watch
 - CHANGE: add `ErrorKind::PathExcluded` and `ErrorKind::WatchOverlap`, reported when a watch is refused because its own filter rejects the directory, or because a filtered directory watch would overlap another one. `ErrorKind` is not `#[non_exhaustive]`, so an exhaustive `match` over it must be updated **breaking**
 - CHANGE: `Watcher::watch_filtered` is now the required `Watcher` trait method; `Watcher::watch` is a provided method that forwards to it with `WatchFilter::accept_all()`. Implementors of `Watcher` must implement `watch_filtered` instead of `watch` **breaking**
 - FEATURE: [FreeBSD] select native inotify automatically when building on FreeBSD 15.0+ and kqueue otherwise. The `freebsd_inotify` feature enables inotify when cross-compiling for FreeBSD 15.0+.

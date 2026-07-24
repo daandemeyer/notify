@@ -637,10 +637,13 @@ pub trait Watcher {
     /// # Ok(())
     /// # }
     /// ```
+    // The error intentionally carries the failed and unapplied `PathOp`s back to the caller,
+    // which makes it larger than clippy's default threshold.
+    #[allow(clippy::result_large_err)]
     fn update_paths(&mut self, ops: Vec<PathOp>) -> StdResult<(), UpdatePathsError> {
         update_paths(ops, |op| match op {
             PathOp::Watch(path, config) => self
-                .watch(&path, config.recursive_mode())
+                .watch_filtered(&path, config.recursive_mode(), config.watch_filter())
                 .map_err(|e| (PathOp::Watch(path, config), e)),
             PathOp::Unwatch(path) => self.unwatch(&path).map_err(|e| (PathOp::Unwatch(path), e)),
         })
@@ -739,6 +742,7 @@ where
     RecommendedWatcher::new(event_handler, Config::default())
 }
 
+#[allow(clippy::result_large_err)]
 pub(crate) fn update_paths<F>(ops: Vec<PathOp>, mut apply: F) -> StdResult<(), UpdatePathsError>
 where
     F: FnMut(PathOp) -> StdResult<(), (PathOp, Error)>,
@@ -840,6 +844,16 @@ mod tests {
             WatchFilter::accept_all().allows_dir(&dangling),
             "accept-all still accepts everything"
         );
+    }
+
+    #[test]
+    fn watch_path_config_carries_watch_filter() {
+        let config = WatchPathConfig::new(RecursiveMode::Recursive)
+            .with_watch_filter(reject_name("excluded"));
+        assert!(config.watch_filter().allows_dir(Path::new("/root/other")));
+        assert!(!config
+            .watch_filter()
+            .allows_dir(Path::new("/root/excluded")));
     }
 
     #[test]
