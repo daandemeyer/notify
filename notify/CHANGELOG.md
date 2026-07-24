@@ -2,6 +2,7 @@
 
 ## unreleased
 
+- FEATURE: add `WatchFilter` and `Watcher::watch_filtered` to exclude directories from a watch. The filter gates directories only, so file watches are never affected. Two restrictions apply: watching a directory the filter itself rejects fails, and a filtered directory watch must not overlap another directory watch in either direction (accept-all watches may overlap as before) [#481]
 - FEATURE: add `WatchPathConfig::with_watch_filter` so `Watcher::update_paths` batches can carry a `WatchFilter` per watch
 - CHANGE: add `ErrorKind::PathExcluded` and `ErrorKind::WatchOverlap`, reported when a watch is refused because its own filter rejects the directory, or because a filtered directory watch would overlap another one. `ErrorKind` is not `#[non_exhaustive]`, so an exhaustive `match` over it must be updated **breaking**
 - CHANGE: `Watcher::watch_filtered` is now the required `Watcher` trait method; `Watcher::watch` is a provided method that forwards to it with `WatchFilter::accept_all()`. Implementors of `Watcher` must implement `watch_filtered` instead of `watch` **breaking**
@@ -18,6 +19,7 @@
 - PERF: [kqueue] avoid filesystem walks for recursive kqueue unwatch
 - FIX: never abandon a recursive watch, report what failed instead
 
+[#481]: https://github.com/notify-rs/notify/issues/481
 [#930]: https://github.com/notify-rs/notify/pull/930
 [#935]: https://github.com/notify-rs/notify/issues/935
 [#958]: https://github.com/notify-rs/notify/pull/958
