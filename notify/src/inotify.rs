@@ -733,9 +733,6 @@ impl EventLoop {
                             is_recursive,
                             watch_self,
                             Some(&existing_watch.metadata),
-                            self.watches
-                                .iter()
-                                .map(|(path, watch)| (path, &watch.metadata)),
                         )
                     } else {
                         WatchMetadata {

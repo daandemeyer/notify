@@ -476,13 +476,7 @@ impl EventLoop {
             .add_filename(&path.absolute, event_filter, filter_flags)
             .map_err(|e| Error::io(e).add_path(path.requested.clone()))?;
         let existing_watch = self.watches.get(&path.absolute);
-        let watch = Watch::new(
-            &path,
-            is_recursive,
-            is_user_watch,
-            existing_watch,
-            self.watches.iter(),
-        );
+        let watch = Watch::new(&path, is_recursive, is_user_watch, existing_watch);
         self.watches.insert(path.absolute, watch);
 
         Ok(())
