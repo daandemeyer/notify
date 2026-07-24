@@ -25,6 +25,9 @@
 - FIX: [kqueue] do not watch below a new symbolic link to a directory when `follow_symlinks` is disabled
 - FIX: [kqueue] watch the entries that are created directly in the target of a recursively watched symbolic link when `follow_symlinks` is disabled
 - FIX: [kqueue] watch a path that is also given with a trailing separator once, so its events are not reported twice and its watch is removed with the path
+- FEATURE: add `WatchFilter` and `Watcher::watch_filtered` to exclude directories from a watch. The filter only applies to directories, so a watch on a file is never affected. Watching a directory the filter itself rejects fails with the new `ErrorKind::PathExcluded`, which `Error::path_excluded` creates. Watches may overlap, and a directory is watched when one of the watches that cover it reaches it and its filter accepts the directory [#204]
+- FEATURE: add `WatchPathConfig::with_watch_filter`, so `Watcher::watch_with` and `Watcher::update_paths` can take a `WatchFilter` per watch
+- CHANGE: `PathOp` carries the `WatchFilter` of a watch, so `UpdatePathsError` grows above the size at which clippy reports `result_large_err` for a function that returns it
 
 [#703]: https://github.com/notify-rs/notify/issues/703
 [#455]: https://github.com/notify-rs/notify/issues/455
@@ -43,6 +46,7 @@
 - DEPS: upgrade `notify-types` to 2.2.0 [#1032]
 - DOCS: clarify WSL2 notification limitations, watching files replaced by editors, and backend behavior when watched paths are renamed, moved, or deleted [#1048] [#1053]
 
+[#204]: https://github.com/notify-rs/notify/issues/204
 [#727]: https://github.com/notify-rs/notify/issues/727
 [#993]: https://github.com/notify-rs/notify/issues/993
 [#1032]: https://github.com/notify-rs/notify/pull/1032

@@ -160,6 +160,30 @@ fn handle_error(err: Error) {
 
 ## Non-breaking changes but worth mentioning
 
+### Directories can be excluded from a watch
+
+`Watcher::watch_filtered` takes a `WatchFilter`, and directories that the filter rejects are
+not watched. The filter only applies to directories. Watching a file is never affected.
+
+`Watcher` implementations do not have to change. `Watcher::watch_filtered` forwards to
+`Watcher::watch_with`, and the default `Watcher::watch_with` returns an error for any filter
+except `WatchFilter::accept_all()`. To support filters, override `Watcher::watch_with` and
+read `WatchPathConfig::watch_filter`. If you already override `Watcher::watch_with` or
+`Watcher::update_paths` and do not support filters, return an error for a filter there.
+Otherwise the filter is ignored and the watch covers directories the caller excluded.
+A `Watcher` that supports filters has to do the following:
+
+- Return `ErrorKind::PathExcluded` and change nothing when `WatchFilter::allows_root` rejects
+  the watched directory itself. It also checks the target of a symlink.
+- Call `WatchFilter::allows_dir` for every directory you find below the watched directory. It
+  also checks the target of a symlink.
+- Pass the filter the requested path joined to the current directory, and the directories
+  below it in the same form, also when the backend resolves links for its own use.
+- Watches can overlap. Watch a directory when one of the watches that cover it reaches it
+  and the filter of that watch accepts the directory. Apply the filter of each watch only to
+  the directories below that watch. `WatchFilter::reaches` tells whether a watch reaches a
+  path.
+
 ### Event-kind filtering was added
 
 `Config::with_event_kinds` and `EventKindMask` allow filtering delivered events:

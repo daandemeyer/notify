@@ -466,6 +466,9 @@ impl FsEventWatcher {
         self.run()
     }
 
+    // The error returns the failed and the remaining `PathOp`s to the caller. That makes it
+    // larger than the size at which clippy reports `result_large_err`.
+    #[allow(clippy::result_large_err)]
     fn update_paths_inner(
         &mut self,
         ops: Vec<crate::PathOp>,
@@ -479,6 +482,10 @@ impl FsEventWatcher {
             .collect();
 
         let result = crate::update_paths(ops, |op| match op {
+            crate::PathOp::Watch(path, config) if !config.watch_filter().is_accept_all() => Err((
+                PathOp::Watch(path, config),
+                Error::generic("this watcher does not support watch filters yet"),
+            )),
             crate::PathOp::Watch(path, config) => self
                 .append_path(&path, config.recursive_mode())
                 .map(|_| ())

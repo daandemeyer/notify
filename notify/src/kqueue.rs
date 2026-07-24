@@ -8,7 +8,7 @@ use super::event::*;
 use super::{
     Config, Error, ErrorKind, EventHandler, EventKindMask, RecursiveMode, Result, Watcher,
 };
-use crate::paths::{WatchPath, absolute_path, is_symlink, reported_path};
+use crate::paths::{WatchPath, absolute_path, reported_path};
 use crate::walk::{
     WalkFailure,
     recursive::{
@@ -446,7 +446,7 @@ impl EventLoop {
         if !watch.is_recursive || !path.is_dir() {
             return Vec::new();
         }
-        let follows_link = self.follow_symlinks || !is_symlink(path);
+        let follows_link = self.follow_symlinks || !crate::paths::is_symlink(path);
         watch
             .recursive_roots(&self.user_roots)
             .filter(|root| follows_link || ***root == *path)

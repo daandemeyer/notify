@@ -4,17 +4,23 @@
 
 use crate::Config;
 
-use super::{RecursiveMode, Result, Watcher};
+use super::{RecursiveMode, Result, WatchPathConfig, Watcher};
 use std::path::{Path, PathBuf};
 
 /// Stub `Watcher` implementation
 ///
-/// Events are never delivered from this watcher.
+/// Events are never delivered from this watcher. It accepts every call, including
+/// [`watch_filtered`](Watcher::watch_filtered) with a rejecting filter: since it never watches
+/// anything or delivers anything, there is nothing for a filter to gate.
 #[derive(Debug)]
 pub struct NullWatcher;
 
 impl Watcher for NullWatcher {
     fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
+        Ok(())
+    }
+
+    fn watch_with(&mut self, path: &Path, config: WatchPathConfig) -> Result<()> {
         Ok(())
     }
 

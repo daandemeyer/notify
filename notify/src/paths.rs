@@ -29,7 +29,6 @@ pub(crate) fn without_trailing_separator(path: &Path) -> PathBuf {
 }
 
 /// Returns whether `path` is a symbolic link, also when `path` ends with a separator.
-#[allow(dead_code)]
 pub(crate) fn is_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(without_trailing_separator(path))
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -54,5 +53,20 @@ pub(crate) fn reported_path(root_absolute: &Path, root_requested: &Path, path: &
     match path.strip_prefix(root_absolute) {
         Ok(relative) if !relative.as_os_str().is_empty() => root_requested.join(relative),
         _ => root_requested.to_path_buf(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_symlink_ignores_a_trailing_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        assert!(is_symlink(&link));
+        assert!(is_symlink(&PathBuf::from(format!("{}/", link.display()))));
+        assert!(!is_symlink(dir.path()));
     }
 }

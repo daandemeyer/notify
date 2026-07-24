@@ -1669,6 +1669,11 @@ impl Watcher for INotifyWatcher {
     }
 
     fn watch_with(&mut self, path: &Path, config: WatchPathConfig) -> Result<()> {
+        if !config.watch_filter().is_accept_all() {
+            return Err(Error::generic(
+                "this watcher does not support watch filters yet",
+            ));
+        }
         self.watch_inner(path, config)
     }
 
