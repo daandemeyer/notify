@@ -593,6 +593,7 @@ impl EventLoop {
     fn add_watch(&mut self, path: WatchPath, is_recursive: bool, watch_self: bool) -> Result<()> {
         let path_is_dir = metadata(&path.absolute).map_err(Error::io_watch)?.is_dir();
         let requested_is_recursive = is_recursive && path_is_dir;
+        let mut inherited_recursive_root = None;
         if watch_self {
             if let Some(watch) = self
                 .watches
@@ -609,7 +610,7 @@ impl EventLoop {
                 // instead of merging with the previous metadata. If the current entry also carries
                 // recursive coverage from an ancestor, remember that ancestor before removal so we
                 // can rebuild that inherited coverage below.
-                let inherited_recursive_root =
+                inherited_recursive_root =
                     if !requested_is_recursive && path_is_dir && watch.metadata.is_recursive {
                         recursive_user_watch_ancestor(
                             &path.absolute,
@@ -620,42 +621,45 @@ impl EventLoop {
                     } else {
                         None
                     };
-                let replaced_path = path.absolute.clone();
-                self.remove_watch(replaced_path.clone(), false)?;
-
-                if let Some((ancestor_path, ancestor_reported_path)) = inherited_recursive_root {
-                    // Removing a directory watch removes its recursively inherited children too.
-                    // Re-add them as non-user watches so the ancestor recursive watch still covers
-                    // this subtree after the user watch is replaced.
-                    let entries = WalkDir::new(&replaced_path)
-                        .follow_links(self.follow_links)
-                        .into_iter()
-                        .filter_map(filter_dir)
-                        .map(|entry| {
-                            let absolute = entry.into_path();
-                            let requested =
-                                reported_path(&ancestor_path, &ancestor_reported_path, &absolute);
-                            WatchPath::from_parts(absolute, requested)
-                        });
-                    self.add_watches_for_paths(entries, true, false)?;
-                }
+                self.remove_watch(path.absolute.clone(), false)?;
             }
         }
 
-        // If the watch is not recursive, or if we determine (by stat'ing the path to get its
-        // metadata) that the watched path is not a directory, add a single path watch.
         if !requested_is_recursive {
-            return self.add_single_watch(path, false, true);
+            // If the watch is not recursive, or if we determine (by stat'ing the path to get its
+            // metadata) that the watched path is not a directory, add a single path watch.
+            self.add_single_watch(path.clone(), false, true)?;
+        } else {
+            let root = path.clone();
+            let entries = WalkDir::new(&root.absolute)
+                .follow_links(self.follow_links)
+                .into_iter()
+                .filter_map(filter_dir)
+                .map(move |entry| root.child(entry.into_path()));
+
+            self.add_watches_for_paths(entries, is_recursive, watch_self)?;
         }
 
-        let root = path.clone();
-        let entries = WalkDir::new(&root.absolute)
-            .follow_links(self.follow_links)
-            .into_iter()
-            .filter_map(filter_dir)
-            .map(move |entry| root.child(entry.into_path()));
+        if let Some((ancestor_path, ancestor_reported_path)) = inherited_recursive_root {
+            // Removing a directory watch removes its recursively inherited children too. Re-add
+            // them as non-user watches so the ancestor recursive watch still covers this subtree
+            // after the user watch is replaced. This runs after the replacement watch is
+            // installed, so the explicit entry owns its own metadata and the rebuilt children
+            // merge inherited coverage on top of it rather than being overwritten by it.
+            let entries = WalkDir::new(&path.absolute)
+                .follow_links(self.follow_links)
+                .into_iter()
+                .filter_map(filter_dir)
+                .map(move |entry| {
+                    let absolute = entry.into_path();
+                    let requested =
+                        reported_path(&ancestor_path, &ancestor_reported_path, &absolute);
+                    WatchPath::from_parts(absolute, requested)
+                });
+            self.add_watches_for_paths(entries, true, false)?;
+        }
 
-        self.add_watches_for_paths(entries, is_recursive, watch_self)
+        Ok(())
     }
 
     fn add_watches_for_paths<I>(
