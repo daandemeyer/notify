@@ -203,6 +203,16 @@ pub(crate) fn filter_allows_event_under(filter: &WatchFilter, root: &Path, path:
     true
 }
 
+/// Whether walkdir pushed a directory listing for `entry`, i.e. whether `skip_current_dir`
+/// would pop this entry's listing rather than its parent's.
+///
+/// walkdir descends into a directory, into a symlink it followed, and into a symlinked walk
+/// root (`follow_root_links` is on by default). Skipping on an entry it never descended into
+/// discards the rest of the parent directory instead.
+pub(crate) fn walkdir_descended_into(entry: &walkdir::DirEntry) -> bool {
+    entry.file_type().is_dir() || entry.depth() == 0
+}
+
 /// Shared `WalkDir::filter_entry` predicate implementing the `WatchFilter` pruning contract:
 /// the filter gates directories only (files always pass), and a rejected directory is neither
 /// yielded nor descended into.
