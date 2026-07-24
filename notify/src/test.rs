@@ -20,6 +20,13 @@ use pretty_assertions::assert_eq;
 
 pub use expect::*;
 
+/// A [`crate::WatchFilter`] rejecting directories named `name`.
+pub fn reject_name(name: &'static str) -> crate::WatchFilter {
+    crate::WatchFilter::with_filter(move |p: &Path| {
+        p.file_name() != Some(std::ffi::OsStr::new(name))
+    })
+}
+
 /// Waits any events from the watcher and provides with some helper methods
 pub struct Receiver {
     pub rx: mpsc::Receiver<Result<Event, Error>>,
@@ -141,7 +148,7 @@ impl Receiver {
     ///
     /// It doesn't fail on timeout, instead it returns None
     ///
-    /// This behaviour is better for tests, because allows us to determine which events was received
+    /// This behaviour is better for tests, because it allows us to determine which events were received
     pub fn iter(&mut self) -> impl Iterator<Item = Event> + '_ {
         struct Iter<'a> {
             rx: &'a mut Receiver,

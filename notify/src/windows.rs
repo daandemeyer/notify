@@ -8,7 +8,9 @@
 use crate::paths::{absolute_path, WatchPath};
 use crate::{bounded, unbounded, BoundSender, Config, Receiver, Sender};
 use crate::{event::*, WatcherKind};
-use crate::{Error, EventHandler, RecursiveMode, Result, Watcher, WindowsPathSeparatorStyle};
+use crate::{
+    Error, EventHandler, RecursiveMode, Result, WatchFilter, Watcher, WindowsPathSeparatorStyle,
+};
 use std::alloc;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -17,6 +19,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use windows_sys::Win32::Foundation::{
@@ -24,13 +27,13 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, ReadDirectoryChangesW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED,
-    FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY,
-    FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME,
-    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SECURITY,
-    FILE_NOTIFY_CHANGE_SIZE, FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FileStandardInfo, GetFileInformationByHandleEx, ReadDirectoryChangesW,
+    FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
+    FILE_ACTION_RENAMED_OLD_NAME, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
+    FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
+    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+    FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE, FILE_NOTIFY_INFORMATION,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Threading::{
     CreateSemaphoreW, ReleaseSemaphore, WaitForSingleObjectEx, INFINITE,
@@ -131,6 +134,10 @@ struct ReadData {
     complete_sem: HANDLE,
     is_recursive: bool,
     separator_style: SeparatorStyle,
+    stopping: Arc<AtomicBool>,
+    // ReadDirectoryChangesW cannot selectively watch directories, so directory filtering is
+    // applied to event paths in the completion routine instead.
+    watch_filter: WatchFilter,
 }
 
 struct ReadDirectoryRequest {
@@ -151,7 +158,7 @@ impl ReadDirectoryRequest {
 }
 
 enum Action {
-    Watch(WatchPath, RecursiveMode, SeparatorStyle),
+    Watch(WatchPath, RecursiveMode, SeparatorStyle, WatchFilter),
     // Internal self-unwatch from the completion callback.
     Unwatch(PathBuf),
     // Public `Watcher::unwatch` path. This variant must ack only after `remove_watch` finishes so
@@ -171,8 +178,11 @@ pub enum MetaEvent {
 struct WatchState {
     dir_handle: HANDLE,
     complete_sem: HANDLE,
+    watch_path_is_dir: bool,
     recursive_mode: RecursiveMode,
     reported_path: PathBuf,
+    watch_filter: WatchFilter,
+    stopping: Arc<AtomicBool>,
 }
 
 struct ReadDirectoryChangesServer {
@@ -226,9 +236,13 @@ impl ReadDirectoryChangesServer {
 
             while let Ok(action) = self.rx.try_recv() {
                 match action {
-                    Action::Watch(path, recursive_mode, separator_style) => {
-                        let res =
-                            self.add_watch(path, recursive_mode.is_recursive(), separator_style);
+                    Action::Watch(path, recursive_mode, separator_style, watch_filter) => {
+                        let res = self.add_watch(
+                            path,
+                            recursive_mode.is_recursive(),
+                            separator_style,
+                            watch_filter,
+                        );
                         let _ = self.cmd_tx.send(res);
                     }
                     Action::Unwatch(path) => self.remove_watch(path),
@@ -283,7 +297,25 @@ impl ReadDirectoryChangesServer {
         path: WatchPath,
         is_recursive: bool,
         separator_style: SeparatorStyle,
+        watch_filter: WatchFilter,
     ) -> Result<PathBuf> {
+        let path_is_dir = path.absolute.is_dir();
+        crate::paths::check_watch_barriers(
+            &path.absolute,
+            &path.requested,
+            path_is_dir,
+            is_recursive && path_is_dir,
+            &watch_filter,
+            self.watches.iter().map(|(path, state)| {
+                (
+                    path,
+                    state.watch_path_is_dir,
+                    state.recursive_mode.is_recursive(),
+                    &state.watch_filter,
+                )
+            }),
+        )?;
+
         // path must exist and be either a file or directory
         if !path.absolute.is_dir() && !path.absolute.is_file() {
             return Err(
@@ -357,6 +389,7 @@ impl ReadDirectoryChangesServer {
                 Error::generic("Failed to create semaphore for watch.").add_path(path.requested)
             );
         }
+        let stopping = Arc::new(AtomicBool::new(false));
         let rd = ReadData {
             watch_path: watched_path.clone(),
             dir: dir_target,
@@ -365,16 +398,21 @@ impl ReadDirectoryChangesServer {
             complete_sem: semaphore,
             is_recursive,
             separator_style,
+            stopping: stopping.clone(),
+            watch_filter: watch_filter.clone(),
         };
         let ws = WatchState {
             dir_handle: handle,
             complete_sem: semaphore,
+            watch_path_is_dir: path_is_dir,
             recursive_mode: if is_recursive {
                 RecursiveMode::Recursive
             } else {
                 RecursiveMode::NonRecursive
             },
             reported_path: path.requested,
+            watch_filter,
+            stopping,
         };
         if let Err(err) = start_read(
             &rd,
@@ -409,6 +447,9 @@ impl ReadDirectoryChangesServer {
 }
 
 fn stop_watch(ws: &WatchState, meta_tx: &Sender<MetaEvent>) {
+    // A successful completion may already be queued when cancellation starts. Mark the watch
+    // first so that callback does not rearm ReadDirectoryChangesW with the handle closed below.
+    ws.stopping.store(true, Ordering::Release);
     unsafe {
         let cio = CancelIo(ws.dir_handle);
         let ch = CloseHandle(ws.dir_handle);
@@ -495,6 +536,28 @@ fn start_read(
     Ok(())
 }
 
+fn is_delete_pending(handle: HANDLE) -> bool {
+    let mut info = FILE_STANDARD_INFO::default();
+    let success = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileStandardInfo,
+            &mut info as *mut _ as *mut c_void,
+            std::mem::size_of_val(&info) as u32,
+        )
+    };
+    success != 0 && info.DeletePending
+}
+
+fn read_data_allows_event(data: &ReadData, path: &Path, absolute_path: &Path) -> bool {
+    (match &data.file {
+        None => true,
+        Some(watch_path) => watch_path == path,
+    }) && data
+        .watch_filter
+        .allows_event_under(&data.dir, absolute_path)
+}
+
 unsafe extern "system" fn handle_event(
     error_code: u32,
     _bytes_written: u32,
@@ -502,6 +565,13 @@ unsafe extern "system" fn handle_event(
 ) {
     let overlapped: Box<OVERLAPPED> = Box::from_raw(overlapped);
     let request: Box<ReadDirectoryRequest> = Box::from_raw(overlapped.hEvent as *mut _);
+
+    // CancelIo does not change a completion that was already queued successfully. Such a callback
+    // can run while stop_watch is waiting for completion, after it has closed the directory handle.
+    if request.data.stopping.load(Ordering::Acquire) {
+        ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
+        return;
+    }
 
     fn emit_event(event_handler: &Mutex<dyn EventHandler>, res: Result<Event>) {
         if let Ok(mut guard) = event_handler.lock() {
@@ -519,12 +589,15 @@ unsafe extern "system" fn handle_event(
         ERROR_ACCESS_DENIED => {
             // ReadDirectoryChangesW returns ERROR_ACCESS_DENIED both when the handle
             // has been invalidated (usually because the watched dir was deleted) and
-            // when access has been revoked; use successful dir absence to tell which.
+            // when access has been revoked. The path can still be visible while the
+            // open directory handle keeps it delete-pending, so check both states.
             // For directory watches, emit a Remove event so consumers learn the
             // watched path is gone, matching inotify IN_DELETE_SELF (#540) and
             // FSEvents ROOT_CHANGED+ITEM_REMOVED. File watches are excluded because
             // FILE_ACTION_REMOVED already fires for the file's parent.
-            if matches!(request.data.dir.try_exists(), Ok(false)) {
+            if matches!(request.data.dir.try_exists(), Ok(false))
+                || is_delete_pending(request.handle)
+            {
                 if request.data.file.is_none() {
                     const KIND: EventKind = EventKind::Remove(RemoveKind::Folder);
                     if request.event_kinds.matches(&KIND) {
@@ -592,12 +665,9 @@ unsafe extern "system" fn handle_event(
             request.data.separator_style,
         );
 
-        // if we are watching a single file, ignore the event unless the path is exactly
-        // the watched file
-        let skip = match request.data.file {
-            None => false,
-            Some(ref watch_path) => *watch_path != path,
-        };
+        // If we are watching a single file, ignore other entries in its parent directory.
+        // Directory filtering suppresses events under directories the filter rejects.
+        let skip = !read_data_allows_event(&request.data, &path, &absolute_path);
 
         if !skip {
             log::trace!(
@@ -764,7 +834,12 @@ impl ReadDirectoryChangesWatcher {
         }
     }
 
-    fn watch_inner(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
+    fn watch_inner(
+        &mut self,
+        path: &Path,
+        recursive_mode: RecursiveMode,
+        watch_filter: WatchFilter,
+    ) -> Result<()> {
         let separator_style = SeparatorStyle::resolve(self.windows_path_separator_style, path);
         let pb = WatchPath::new(path)?;
         // path must exist and be either a file or directory
@@ -774,7 +849,7 @@ impl ReadDirectoryChangesWatcher {
             ));
         }
         self.send_action_require_ack(
-            Action::Watch(pb.clone(), recursive_mode, separator_style),
+            Action::Watch(pb.clone(), recursive_mode, separator_style, watch_filter),
             &pb.absolute,
         )
     }
@@ -808,8 +883,13 @@ impl Watcher for ReadDirectoryChangesWatcher {
         )
     }
 
-    fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
-        self.watch_inner(path, recursive_mode)
+    fn watch_filtered(
+        &mut self,
+        path: &Path,
+        recursive_mode: RecursiveMode,
+        watch_filter: WatchFilter,
+    ) -> Result<()> {
+        self.watch_inner(path, recursive_mode, watch_filter)
     }
 
     fn unwatch(&mut self, path: &Path) -> Result<()> {
@@ -848,7 +928,7 @@ unsafe impl Sync for ReadDirectoryChangesWatcher {}
 #[cfg(test)]
 pub mod tests {
     use std::env;
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::os::windows::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -858,13 +938,161 @@ pub mod tests {
 
     use super::{normalize_path_separators, trim_leading_separators, SeparatorStyle};
     use crate::{
-        test::*, ReadDirectoryChangesWatcher, RecursiveMode, Watcher, WindowsPathSeparatorStyle,
+        test::*, ErrorKind, PathOp, ReadDirectoryChangesWatcher, RecursiveMode, WatchFilter,
+        WatchPathConfig, Watcher, WindowsPathSeparatorStyle,
     };
 
     use std::time::Duration;
 
     fn watcher() -> (TestWatcher<ReadDirectoryChangesWatcher>, Receiver) {
         channel()
+    }
+
+    fn read_data_with_filter(watch_filter: WatchFilter) -> super::ReadData {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+
+        super::ReadData {
+            watch_path: PathBuf::from(r"C:\watched"),
+            dir: PathBuf::from(r"C:\watched"),
+            reported_dir: PathBuf::from(r"C:\watched"),
+            file: None,
+            complete_sem: INVALID_HANDLE_VALUE,
+            is_recursive: true,
+            separator_style: SeparatorStyle::Backslash,
+            stopping: Arc::new(AtomicBool::new(false)),
+            watch_filter,
+        }
+    }
+
+    #[test]
+    fn read_data_allows_event_suppresses_filtered_descendants() {
+        let data = read_data_with_filter(WatchFilter::with_filter(|p: &Path| {
+            p.file_name() != Some(OsStr::new("excluded"))
+        }));
+
+        assert!(super::read_data_allows_event(
+            &data,
+            Path::new(r"C:\watched\included\file.txt"),
+            Path::new(r"C:\watched\included\file.txt")
+        ));
+        assert!(super::read_data_allows_event(
+            &data,
+            Path::new(r"C:\watched\excluded"),
+            Path::new(r"C:\watched\excluded")
+        ));
+        assert!(
+            !super::read_data_allows_event(
+                &data,
+                Path::new(r"C:\watched\excluded\file.txt"),
+                Path::new(r"C:\watched\excluded\file.txt")
+            ),
+            "events beneath a rejected directory must be suppressed"
+        );
+    }
+
+    #[test]
+    fn read_data_allows_event_does_not_filter_file_roots() {
+        let watched_file = PathBuf::from(r"C:\watched\blocked.txt");
+        let mut data = read_data_with_filter(WatchFilter::with_filter({
+            let watched_file = watched_file.clone();
+            move |p: &Path| p != watched_file.as_path()
+        }));
+        data.file = Some(watched_file.clone());
+
+        assert!(
+            super::read_data_allows_event(&data, &watched_file, &watched_file),
+            "the directory filter must not reject a directly watched file"
+        );
+        assert!(!super::read_data_allows_event(
+            &data,
+            Path::new(r"C:\watched\other.txt"),
+            Path::new(r"C:\watched\other.txt")
+        ));
+    }
+
+    #[test]
+    fn read_data_allows_event_suppresses_deeply_nested_descendants() {
+        let data = read_data_with_filter(WatchFilter::with_filter(|p: &Path| {
+            p.file_name() != Some(OsStr::new("excluded"))
+        }));
+
+        // A rejected directory anywhere in the ancestor chain suppresses the event, however
+        // deeply it is nested below that directory.
+        assert!(
+            !super::read_data_allows_event(
+                &data,
+                Path::new(r"C:\watched\excluded\a\b\deep.txt"),
+                Path::new(r"C:\watched\excluded\a\b\deep.txt"),
+            ),
+            "an event deep beneath a rejected directory must be suppressed"
+        );
+
+        // A deep path whose ancestors are all accepted is still delivered: the multi-level
+        // ancestor walk must not over-suppress.
+        assert!(
+            super::read_data_allows_event(
+                &data,
+                Path::new(r"C:\watched\a\b\c\deep.txt"),
+                Path::new(r"C:\watched\a\b\c\deep.txt"),
+            ),
+            "a deep event with no rejected ancestor must be delivered"
+        );
+    }
+
+    #[test]
+    fn update_paths_carries_watch_filter_to_root_rejection(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let root = dir.path().to_path_buf();
+        let rejecting = std::path::absolute(&root)?;
+
+        let (tx, _rx) = mpsc::channel();
+        let mut watcher = ReadDirectoryChangesWatcher::new(tx, crate::Config::default())?;
+
+        let result = watcher.update_paths(vec![PathOp::Watch(
+            root,
+            WatchPathConfig::new(RecursiveMode::Recursive).with_watch_filter(
+                WatchFilter::with_filter(move |p: &Path| p != rejecting.as_path()),
+            ),
+        )]);
+        assert!(
+            matches!(result, Err(ref e) if matches!(e.source.kind, ErrorKind::PathExcluded)),
+            "update_paths must pass the filter through to watch_filtered, got {result:?}"
+        );
+        assert!(watcher.watched_paths()?.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_root_preserves_existing_watch(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let root = dir.path().to_path_buf();
+        let rejecting = std::path::absolute(&root)?;
+
+        let (tx, _rx) = mpsc::channel();
+        let mut watcher = ReadDirectoryChangesWatcher::new(tx, crate::Config::default())?;
+        watcher.watch(&root, RecursiveMode::Recursive)?;
+        let before = watcher.watched_paths()?;
+
+        let result = watcher.watch_filtered(
+            &root,
+            RecursiveMode::Recursive,
+            WatchFilter::with_filter(move |p: &Path| p != rejecting.as_path()),
+        );
+
+        assert!(
+            matches!(result, Err(ref e) if matches!(e.kind, ErrorKind::PathExcluded)),
+            "watching a rejected root must fail with PathExcluded: {result:?}"
+        );
+        assert_eq!(
+            watcher.watched_paths()?,
+            before,
+            "a failed rewatch must leave existing watches unchanged"
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -988,6 +1216,8 @@ pub mod tests {
                 complete_sem,
                 is_recursive: false,
                 separator_style: SeparatorStyle::Backslash,
+                stopping: Arc::new(AtomicBool::new(false)),
+                watch_filter: crate::WatchFilter::accept_all(),
             },
             action_tx,
         });
@@ -1007,6 +1237,59 @@ pub mod tests {
             )),
             "unexpected remove event: {events:#?}"
         );
+    }
+
+    #[test]
+    fn stopped_watch_does_not_rearm_queued_successful_completion() {
+        use std::ptr;
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_SUCCESS, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+        };
+        use windows_sys::Win32::System::Threading::{CreateSemaphoreW, WaitForSingleObjectEx};
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let complete_sem = unsafe { CreateSemaphoreW(ptr::null_mut(), 0, 1, ptr::null_mut()) };
+        assert!(!complete_sem.is_null());
+        assert_ne!(complete_sem, INVALID_HANDLE_VALUE);
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, action_rx) = crate::unbounded();
+        let event_handler: Arc<Mutex<dyn crate::EventHandler>> = Arc::new(Mutex::new(event_tx));
+        let request = Box::new(super::ReadDirectoryRequest {
+            event_handler,
+            event_kinds: crate::EventKindMask::ALL,
+            buffer: [0u8; super::BUF_SIZE as usize],
+            handle: INVALID_HANDLE_VALUE,
+            data: super::ReadData {
+                watch_path: PathBuf::from(r"C:\watched"),
+                dir: PathBuf::from(r"C:\watched"),
+                reported_dir: PathBuf::from(r"C:\watched"),
+                file: None,
+                complete_sem,
+                is_recursive: false,
+                separator_style: SeparatorStyle::Backslash,
+                stopping: Arc::new(AtomicBool::new(true)),
+                watch_filter: crate::WatchFilter::accept_all(),
+            },
+            action_tx,
+        });
+        let mut overlapped = Box::new(unsafe { std::mem::zeroed::<OVERLAPPED>() });
+        overlapped.hEvent = Box::into_raw(request) as _;
+
+        unsafe {
+            // CancelIo can leave an already-queued completion with ERROR_SUCCESS. The invalid
+            // handle makes any accidental attempt to rearm the request fail deterministically.
+            super::handle_event(ERROR_SUCCESS, 0, Box::into_raw(overlapped));
+            assert_eq!(
+                WaitForSingleObjectEx(complete_sem, 0, 0),
+                WAIT_OBJECT_0,
+                "completion callback did not release the watch semaphore"
+            );
+            CloseHandle(complete_sem);
+        }
+
+        assert!(event_rx.try_iter().next().is_none(), "unexpected event");
+        assert!(action_rx.try_iter().next().is_none(), "unexpected action");
     }
 
     #[test]
@@ -1032,6 +1315,8 @@ pub mod tests {
                 complete_sem: INVALID_HANDLE_VALUE,
                 is_recursive: false,
                 separator_style: SeparatorStyle::Backslash,
+                stopping: Arc::new(AtomicBool::new(false)),
+                watch_filter: crate::WatchFilter::accept_all(),
             },
             action_tx,
         };
