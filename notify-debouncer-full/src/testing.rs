@@ -6,7 +6,7 @@ use std::{
 
 use file_id::FileId;
 use notify::{
-    Error, ErrorKind, Event, EventKind, RecursiveMode,
+    Error, ErrorKind, Event, EventKind, RecursiveMode, WatchFilter,
     event::{
         AccessKind, AccessMode, CreateKind, DataChange, Flag, MetadataKind, ModifyKind, RemoveKind,
         RenameMode,
@@ -16,6 +16,12 @@ use notify::{
 use crate::{DebounceDataInner, DebouncedEvent, FileIdCache, Queue, time::Instant};
 
 pub(crate) use schema::TestCase;
+
+pub(crate) fn reject_name(name: &'static str) -> WatchFilter {
+    WatchFilter::with_filter(move |path: &Path| {
+        path.file_name() != Some(std::ffi::OsStr::new(name))
+    })
+}
 
 mod schema {
     use std::collections::HashMap;

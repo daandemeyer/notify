@@ -47,20 +47,66 @@ pub trait FileIdCache {
     /// This will be called if a new file or directory is created or if an existing file is overridden.
     ///
     /// `roots` are the watches that cover `path`: a watch on `path` itself and the recursive
-    /// watches above it. The default implementation walks `path` and calls `add_single_path` for
-    /// each entry. When no root is recursive, the walk stops at the direct children of `path`.
+    /// watches above it that reach `path`. The default implementation walks `path` and calls
+    /// `add_single_path` for each entry that one of the roots reaches. A non-recursive root
+    /// reaches the direct children of `path`.
+    ///
+    /// A root does not enter a directory that its [`WatchFilter`](notify::WatchFilter) rejects,
+    /// and that includes `path` when it is not the path of the root. The watch does not report
+    /// changes below such a directory, so IDs cached there would never be removed. The ID of the
+    /// rejected directory itself is cached, because its watched parent reports its events.
     fn add_path(&mut self, path: &Path, roots: &[&WatchRoot]) {
-        let is_recursive = roots
+        let max_depth = |root: &WatchRoot| match root.config.recursive_mode() {
+            RecursiveMode::Recursive => usize::MAX,
+            RecursiveMode::NonRecursive => 1,
+        };
+        // The filter receives absolute paths, in the form that the backends build. The cache
+        // keys keep the form of `path`, because the delivered event paths have that form.
+        let absolute = roots
             .iter()
-            .any(|root| root.config.recursive_mode() == RecursiveMode::Recursive);
-        let max_depth = if is_recursive { usize::MAX } else { 1 };
-        for entry in WalkDir::new(path)
+            .any(|root| !root.config.watch_filter().is_accept_all())
+            .then(|| crate::absolute_path(path));
+        let mut walk = WalkDir::new(path)
             .follow_links(true)
-            .max_depth(max_depth)
-            .into_iter()
-            .flatten()
-        {
+            .max_depth(roots.iter().map(|root| max_depth(root)).max().unwrap_or(0))
+            .into_iter();
+        // The indices in `roots` of the roots that enter the last directory at each depth.
+        let mut entering: Vec<Vec<usize>> = Vec::new();
+        while let Some(entry) = walk.next() {
+            let Ok(entry) = entry else { continue };
+            let depth = entry.depth();
+            entering.truncate(depth);
             self.add_single_path(entry.path());
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            let reaching = entering
+                .last()
+                .cloned()
+                .unwrap_or_else(|| (0..roots.len()).collect());
+            let entered: Vec<_> = reaching
+                .into_iter()
+                .filter(|&index| {
+                    let root = roots[index];
+                    let watch_filter = root.config.watch_filter();
+                    // The watcher checks the root of a watch when it is added.
+                    depth < max_depth(root)
+                        && ((depth == 0 && path == root.path)
+                            || watch_filter.is_accept_all()
+                            || absolute.as_ref().is_some_and(|absolute| {
+                                match entry.path().strip_prefix(path) {
+                                    Ok(relative) if depth > 0 => {
+                                        watch_filter.allows_dir(&absolute.join(relative))
+                                    }
+                                    _ => watch_filter.allows_dir(absolute),
+                                }
+                            }))
+                })
+                .collect();
+            if entered.is_empty() {
+                walk.skip_current_dir();
+            }
+            entering.push(entered);
         }
     }
 
