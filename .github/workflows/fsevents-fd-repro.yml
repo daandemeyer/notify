@@ -1,0 +1,100 @@
+# Scratch workflow. Runs the FSEvents descriptor probe on real macOS runners,
+# which is the only place it can run: there is no Mac to hand, and rust-lang/rust
+# runs no macOS jobs on pull requests.
+#
+# Deliberately not part of ci.yml, and not triggered on main.
+name: fsevents fd repro
+
+on:
+  push:
+    branches: [fsevents-fd-repro]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+
+    # Across macOS versions, because "is this a regression and when" is the first
+    # thing anyone will ask.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-26]
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Show the runner image
+        run: sw_vers && uname -m
+
+      # The file that will actually be attached to the bug report, so it has to
+      # build and run cleanly on a stock toolchain with no flags beyond the
+      # framework link.
+      # Mechanical minimisation: each STEP removes exactly one more thing from
+      # the code path that is known to reproduce. The lowest STEP that stops
+      # reproducing identifies what is actually required.
+      # The file that will be attached to the bug report. It must build and run
+      # on a stock toolchain with nothing but the framework link.
+      # The file attached to the bug report. Verified to reproduce, unlike four
+      # smaller hand written versions: cuts that are each safe on their own are
+      # not safe in combination, so this is the smallest form actually tested.
+      # The file attached to the bug report. Verified to reproduce, unlike four
+      # smaller hand written versions: cuts that are each safe on their own are
+      # not safe in combination, so this is the smallest form actually tested.
+      #
+      # Also swept across descriptor limits, to establish whether 1024 is an
+      # internal FSEvents constant or just RLIMIT_NOFILE in disguise. If the
+      # threshold tracked the limit, 1025 would stop reproducing once the limit
+      # is raised well above it.
+      # Self calibrating now: the reproducer reads RLIMIT_NOFILE and derives the
+      # counts, so it behaves the same whatever limit the machine happens to
+      # have. Run under several limits to confirm that.
+      # The file attached to the bug report. Self calibrating, so it behaves the
+      # same whatever descriptor limit the machine has. Run under several limits
+      # to confirm that, since a hardcoded count was what made five earlier
+      # attempts at this file appear not to reproduce.
+      - name: Minimal reproducer
+        working-directory: fsevents-fd-repro
+        run: |
+          cc -Wall -Wextra -o fb-repro trace/fb-repro.c -framework CoreServices 2>&1 \
+            | grep -v deprecated || true
+          for lim in 256 1024 10240; do
+            dir="$RUNNER_TEMP/fb-$lim"
+            rm -rf "$dir"; mkdir -p "$dir"
+            echo "--- limit $lim"
+            ( ulimit -n "$lim"; ./fb-repro "$dir" ) && echo "RESULT $lim: did NOT reproduce" \
+              || echo "RESULT $lim: reproduced"
+            rm -rf "$dir"
+          done
+
+      - name: Threshold vs descriptor limit
+        working-directory: fsevents-fd-repro
+        run: |
+          cc -O1 -g -Wall -Wextra -o probe trace/probe.c -framework CoreServices
+          for lim in 256 512 1000 1024 3000 5000 8192; do
+            dir="$RUNNER_TEMP/lim-$lim"
+            rm -rf "$dir"; mkdir -p "$dir"
+            (
+              ulimit -n "$lim"
+              echo "=== fd limit $(ulimit -n), limit/10 = $((lim / 10))"
+              ./probe "$dir" bisect || true
+            )
+            rm -rf "$dir"
+          done
+
+      - name: Attribute the close
+        working-directory: fsevents-fd-repro
+        # Names the FSEvents function that closes the descriptor, rather than
+        # only showing that one was closed.
+        run: |
+          cc -dynamiclib -O1 -g -o libclosetrace.dylib trace/close_trace.c
+          dir="$RUNNER_TEMP/probe-trace"
+          mkdir -p "$dir"
+          DYLD_INSERT_LIBRARIES="$PWD/libclosetrace.dylib" ./probe "$dir" scale || true
