@@ -736,11 +736,15 @@ impl EventLoop {
                             return Err(Error::io_watch(e).add_path(path.requested));
                         }
                     };
+                    // inotify does not implement filtering yet; it always records an
+                    // accept-all filter.
                     let metadata = WatchMetadata::new(
                         &path,
+                        is_dir,
                         is_recursive,
                         watch_self,
                         existing_watch.map(|watch| &watch.metadata),
+                        WatchFilter::accept_all(),
                     );
 
                     self.watches.insert(

@@ -480,7 +480,15 @@ impl EventLoop {
             .add_filename(&path.absolute, event_filter, filter_flags)
             .map_err(|e| Error::io(e).add_path(path.requested.clone()))?;
         let existing_watch = self.watches.get(&path.absolute);
-        let watch = Watch::new(&path, is_recursive, is_user_watch, existing_watch);
+        // kqueue does not implement filtering yet; it always records an accept-all filter.
+        let watch = Watch::new(
+            &path,
+            path.absolute.is_dir(),
+            is_recursive,
+            is_user_watch,
+            existing_watch,
+            WatchFilter::accept_all(),
+        );
         self.watches.insert(path.absolute, watch);
 
         Ok(())
