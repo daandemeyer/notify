@@ -7,7 +7,7 @@
 use super::event::*;
 use super::{
     Config, Error, ErrorKind, EventHandler, PathOp, RecursiveMode, Result, UpdatePathsError,
-    WatchPathConfig, Watcher,
+    WatchFilter, WatchPathConfig, Watcher,
 };
 use crate::paths::{WatchPath, absolute_path, reported_path};
 use crate::walk::{
@@ -942,11 +942,14 @@ impl EventLoop {
             .is_some_and(Watch::is_walk_barrier);
 
         if let Some(root) = self.user_roots.get(path.absolute.as_path()) {
-            if root.rewatch_is_noop(&path.requested, requested_is_recursive)
-                && self
-                    .watches
-                    .get(&path.absolute)
-                    .is_some_and(|watch| watch.dereference == dereference)
+            if root.rewatch_is_noop(
+                &path.requested,
+                requested_is_recursive,
+                &WatchFilter::accept_all(),
+            ) && self
+                .watches
+                .get(&path.absolute)
+                .is_some_and(|watch| watch.dereference == dereference)
             {
                 return Ok(());
             }
@@ -984,6 +987,7 @@ impl EventLoop {
             UserRoot {
                 requested: path.requested.clone(),
                 is_recursive,
+                watch_filter: WatchFilter::accept_all(),
             },
         );
         let result = if is_recursive {
@@ -1749,7 +1753,7 @@ mod tests {
     use super::inotify_sys::WatchMask;
     use super::{
         Config, Error, ErrorKind, Event, EventKind, EventLoop, INotifyWatcher, RecursiveMode,
-        Result, WatchPath, WatchPathConfig, Watcher,
+        Result, WatchFilter, WatchPath, WatchPathConfig, Watcher,
     };
     use notify_types::event::{
         CreateKind, DataChange, EventKindMask, ModifyKind, RemoveKind, RenameMode,
@@ -1849,6 +1853,7 @@ mod tests {
             crate::walk::recursive::UserRoot {
                 requested: root.clone(),
                 is_recursive: true,
+                watch_filter: WatchFilter::accept_all(),
             },
         );
         let result = event_loop.add_watches_for_paths(

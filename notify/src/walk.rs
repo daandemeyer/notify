@@ -25,7 +25,7 @@ impl WalkFailure {
 // Inotify and kqueue manage recursive watches one directory at a time.
 pub(crate) mod recursive {
     use crate::paths::{WatchPath, reported_path};
-    use crate::{RecursiveMode, Result};
+    use crate::{RecursiveMode, Result, WatchFilter};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -48,6 +48,7 @@ pub(crate) mod recursive {
     pub(crate) struct UserRoot {
         pub(crate) requested: PathBuf,
         pub(crate) is_recursive: bool,
+        pub(crate) watch_filter: WatchFilter,
     }
 
     /// The user watches by path. Every entry that a user watch covers keeps a reference to its
@@ -177,12 +178,19 @@ pub(crate) mod recursive {
     impl UserRoot {
         /// Whether a user rewatch with these parameters requests exactly the current watch, so
         /// the backend can skip the teardown and rebuild.
+        ///
+        /// Only unfiltered watches can short-circuit. Two filters cannot be compared for
+        /// behavioral equality, so any watch involving a filter is rebuilt.
         pub(crate) fn rewatch_is_noop(
             &self,
             requested: &Path,
             requested_is_recursive: bool,
+            watch_filter: &WatchFilter,
         ) -> bool {
-            self.is_recursive == requested_is_recursive && self.requested == requested
+            self.is_recursive == requested_is_recursive
+                && self.requested == requested
+                && self.watch_filter.is_accept_all()
+                && watch_filter.is_accept_all()
         }
     }
 
@@ -194,6 +202,7 @@ pub(crate) mod recursive {
             UserRoot {
                 requested: PathBuf::from(requested),
                 is_recursive,
+                watch_filter: WatchFilter::accept_all(),
             }
         }
 

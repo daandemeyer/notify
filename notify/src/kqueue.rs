@@ -6,7 +6,8 @@
 
 use super::event::*;
 use super::{
-    Config, Error, ErrorKind, EventHandler, EventKindMask, RecursiveMode, Result, Watcher,
+    Config, Error, ErrorKind, EventHandler, EventKindMask, RecursiveMode, Result, WatchFilter,
+    Watcher,
 };
 use crate::paths::{WatchPath, absolute_path, reported_path};
 use crate::walk::{
@@ -479,7 +480,11 @@ impl EventLoop {
         let requested_is_recursive = is_recursive && path_is_dir;
 
         if let Some(root) = self.user_roots.get(path.absolute.as_path()) {
-            if root.rewatch_is_noop(&path.requested, requested_is_recursive) {
+            if root.rewatch_is_noop(
+                &path.requested,
+                requested_is_recursive,
+                &WatchFilter::accept_all(),
+            ) {
                 return Ok(());
             }
             // The entries that other user watches cover stay.
@@ -492,6 +497,7 @@ impl EventLoop {
             UserRoot {
                 requested: path.requested.clone(),
                 is_recursive: requested_is_recursive,
+                watch_filter: WatchFilter::accept_all(),
             },
         );
         let result = if requested_is_recursive {
