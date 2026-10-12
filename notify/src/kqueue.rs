@@ -12,8 +12,8 @@ use crate::paths::{WatchPath, absolute_path, reported_path};
 use crate::walk::{
     WalkFailure,
     recursive::{
-        WalkRoots, WatchMetadata as Watch, is_preserved_watch_root, preserved_watch_mode,
-        preserved_watch_roots, recursive_user_watch_ancestor,
+        UserRoot, UserRoots, WatchMetadata as Watch, remove_failed_user_root, remove_user_roots,
+        watched_paths,
     },
 };
 use crate::{Receiver, Sender, unbounded};
@@ -44,6 +44,7 @@ struct EventLoop {
     kqueue: kqueue::Watcher,
     event_handler: Box<dyn EventHandler>,
     watches: HashMap<PathBuf, Watch>,
+    user_roots: UserRoots,
     follow_symlinks: bool,
     event_kinds: EventKindMask,
 }
@@ -114,6 +115,7 @@ impl EventLoop {
             kqueue,
             event_handler,
             watches: HashMap::new(),
+            user_roots: UserRoots::new(),
             follow_symlinks,
             event_kinds,
         };
@@ -171,28 +173,13 @@ impl EventLoop {
         while let Ok(msg) = self.event_loop_rx.try_recv() {
             match msg {
                 EventLoopMsg::AddWatch(path, recursive_mode, tx) => {
-                    let _ = tx.send(self.add_watch(path, recursive_mode.is_recursive(), true));
+                    let _ = tx.send(self.add_watch(path, recursive_mode.is_recursive()));
                 }
                 EventLoopMsg::RemoveWatch(path, tx) => {
                     let _ = tx.send(self.remove_watch(path, false));
                 }
                 EventLoopMsg::GetWatchedPaths(tx) => {
-                    let _ = tx.send(
-                        self.watches
-                            .iter()
-                            .filter(|(_path, watch)| watch.is_user_watch)
-                            .map(|(_path, watch)| {
-                                (
-                                    watch.reported_path.clone(),
-                                    if watch.user_is_recursive {
-                                        RecursiveMode::Recursive
-                                    } else {
-                                        RecursiveMode::NonRecursive
-                                    },
-                                )
-                            })
-                            .collect(),
-                    );
+                    let _ = tx.send(watched_paths(&self.user_roots));
                 }
                 EventLoopMsg::Shutdown => {
                     self.running = false;
@@ -236,17 +223,19 @@ impl EventLoop {
                         // Non-recursive watches report the directory's data change instead.
                         // Context: https://github.com/notify-rs/notify/issues/644
                         kqueue::Vnode::Write
-                            if watch.is_some_and(|watch| watch.is_recursive)
-                                && if self.follow_symlinks {
-                                    path.is_dir()
-                                } else {
-                                    std::fs::symlink_metadata(&path)
-                                        .is_ok_and(|metadata| metadata.is_dir())
-                                } =>
+                            if watch
+                                .is_some_and(|watch| self.discovers_new_entries(&path, watch)) =>
                         {
                             if !abort_additions {
-                                refresh_dirs
-                                    .push(WatchPath::from_parts(path.clone(), event_path.clone()));
+                                let roots: Vec<_> = watch
+                                    .into_iter()
+                                    .flat_map(|watch| watch.recursive_roots(&self.user_roots))
+                                    .cloned()
+                                    .collect();
+                                refresh_dirs.push((
+                                    WatchPath::from_parts(path.clone(), event_path.clone()),
+                                    roots,
+                                ));
                             }
                             let error_path = event_path.clone();
                             // find which file is new in the directory by comparing it with our
@@ -365,7 +354,7 @@ impl EventLoop {
         // skip the new entry.
         let mut add_watches = Vec::new();
         let mut scanned = HashSet::new();
-        for dir in refresh_dirs {
+        for (dir, roots) in refresh_dirs {
             if abort_additions {
                 break;
             }
@@ -375,7 +364,9 @@ impl EventLoop {
                 continue;
             }
             match self.untracked_entries(&dir, &mut errors) {
-                Ok(entries) => add_watches.extend(entries),
+                Ok(entries) => {
+                    add_watches.extend(entries.into_iter().map(|path| (path, roots.clone())));
+                }
                 Err(err) => {
                     errors.errors.push(err);
                     abort_additions = true;
@@ -384,7 +375,7 @@ impl EventLoop {
         }
 
         let watch_count = self.watches.len();
-        for path in add_watches {
+        for (path, roots) in add_watches {
             if abort_additions {
                 break;
             }
@@ -392,7 +383,7 @@ impl EventLoop {
             if self.watches.contains_key(&path.absolute) {
                 continue;
             }
-            if let Err(err) = self.add_watch_entries(path, true, false, &mut errors) {
+            if let Err(err) = self.walk(path, &roots, false, &mut errors) {
                 errors.errors.push(err);
                 abort_additions = true;
             }
@@ -452,14 +443,21 @@ impl EventLoop {
         Ok(paths)
     }
 
-    fn add_watch(
-        &mut self,
-        path: WatchPath,
-        is_recursive: bool,
-        is_user_watch: bool,
-    ) -> Result<()> {
+    /// Whether a write to the directory `path` makes new-entry discovery look for new entries
+    /// in it. Discovery runs for a directory that a recursive user watch covers, and without
+    /// `follow_symlinks` not for a symbolic link to a directory.
+    fn discovers_new_entries(&self, path: &Path, watch: &Watch) -> bool {
+        watch.is_recursive
+            && if self.follow_symlinks {
+                path.is_dir()
+            } else {
+                std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+            }
+    }
+
+    fn add_watch(&mut self, path: WatchPath, is_recursive: bool) -> Result<()> {
         let mut errors = WatchErrors::default();
-        let result = self.add_watch_entries(path, is_recursive, is_user_watch, &mut errors);
+        let result = self.add_user_watch(path, is_recursive, &mut errors);
         // Register the watches that were added even if adding failed partway. A watch that is in
         // `self.watches` but not registered never reports the deletion of its path, so it would
         // never be removed.
@@ -470,90 +468,61 @@ impl EventLoop {
         registration.and(result)
     }
 
-    fn add_watch_entries(
+    fn add_user_watch(
         &mut self,
         path: WatchPath,
         is_recursive: bool,
-        is_user_watch: bool,
         errors: &mut WatchErrors,
     ) -> Result<()> {
-        let path_is_dir = match metadata(&path.absolute) {
-            Ok(metadata) => metadata.is_dir(),
-            Err(err) => {
-                return errors.handle(
-                    map_kqueue_io_error(err).add_path(path.requested),
-                    Some(&path.absolute),
-                    is_user_watch,
-                );
-            }
-        };
+        let path_is_dir = metadata(&path.absolute)
+            .map_err(|err| map_kqueue_io_error(err).add_path(path.requested.clone()))?
+            .is_dir();
         let requested_is_recursive = is_recursive && path_is_dir;
-        if is_user_watch {
-            if let Some(watch) = self
-                .watches
-                .get(&path.absolute)
-                .filter(|watch| watch.is_user_watch)
-            {
-                if watch.user_is_recursive == requested_is_recursive
-                    && watch.reported_path == path.requested
-                {
-                    return Ok(());
-                }
 
-                // Rewatching an explicit user watch replaces its requested mode and reported path
-                // instead of merging with the previous metadata. If the current entry also carries
-                // recursive coverage from an ancestor, remember that ancestor before removal so we
-                // can rebuild that inherited coverage below.
-                let inherited_recursive_root =
-                    if !requested_is_recursive && path_is_dir && watch.is_recursive {
-                        recursive_user_watch_ancestor(&path.absolute, self.watches.iter())
-                    } else {
-                        None
-                    };
-                let replaced_path = path.absolute.clone();
-                self.remove_watch(replaced_path.clone(), false)?;
-
-                if let Some((ancestor_path, ancestor_reported_path)) = inherited_recursive_root {
-                    // Removing a directory watch removes its recursively inherited children too.
-                    // Re-add them as non-user watches so the ancestor recursive watch still covers
-                    // this subtree after the user watch is replaced.
-                    let requested =
-                        reported_path(&ancestor_path, &ancestor_reported_path, &replaced_path);
-                    self.add_recursive_watch(
-                        WatchPath::from_parts(replaced_path, requested),
-                        false,
-                        errors,
-                    )?;
-                }
+        if let Some(root) = self.user_roots.get(path.absolute.as_path()) {
+            if root.rewatch_is_noop(&path.requested, requested_is_recursive) {
+                return Ok(());
             }
+            // The entries that other user watches cover stay.
+            self.remove_watch(path.absolute.clone(), false)?;
         }
 
-        // If the watch is not recursive, or if we determine (by stat'ing the path to get its
-        // metadata) that the watched path is not a directory, add a single path watch.
-        if !requested_is_recursive {
-            let absolute = path.absolute.clone();
-            if let Err(err) = self.add_single_watch(path, false, is_user_watch) {
-                errors.handle(err, Some(&absolute), is_user_watch)?;
-            }
+        let root: Arc<Path> = Arc::from(path.absolute.as_path());
+        self.user_roots.insert(
+            root.clone(),
+            UserRoot {
+                requested: path.requested.clone(),
+                is_recursive: requested_is_recursive,
+            },
+        );
+        let result = if requested_is_recursive {
+            self.walk(path, std::slice::from_ref(&root), true, errors)
         } else {
-            self.add_recursive_watch(path, is_user_watch, errors)?;
-        }
-
-        Ok(())
+            self.add_single_watch(path, std::slice::from_ref(&root), true)
+        };
+        remove_failed_user_root(
+            &mut self.user_roots,
+            &root,
+            &result,
+            self.watches.get(&*root),
+        );
+        result
     }
 
-    fn add_recursive_watch(
+    /// Adds `roots` to the entries that the walk from `from` reaches. With `is_user_watch`,
+    /// `from` is the path of a user watch, and a failure on it fails the walk.
+    fn walk(
         &mut self,
-        root: WatchPath,
+        from: WatchPath,
+        roots: &[Arc<Path>],
         is_user_watch: bool,
         errors: &mut WatchErrors,
     ) -> Result<()> {
-        let mut walk = WalkDir::new(&root.absolute)
+        let mut walk = WalkDir::new(&from.absolute)
             .follow_links(self.follow_symlinks)
             .into_iter();
-        let mut roots = WalkRoots::new(root);
         while let Some(entry) = walk.next() {
-            if self.add_walk_entry(entry, &mut roots, is_user_watch, errors)? {
+            if self.add_walk_entry(entry, &from, roots, is_user_watch, errors)? {
                 walk.skip_current_dir();
             }
         }
@@ -564,7 +533,8 @@ impl EventLoop {
     fn add_walk_entry(
         &mut self,
         entry: walkdir::Result<walkdir::DirEntry>,
-        roots: &mut WalkRoots,
+        from: &WatchPath,
+        roots: &[Arc<Path>],
         is_user_watch: bool,
         errors: &mut WatchErrors,
     ) -> Result<bool> {
@@ -573,8 +543,8 @@ impl EventLoop {
                 let depth = entry.depth();
                 let is_dir = entry.file_type().is_dir();
                 let absolute = entry.into_path();
-                let path = roots.entry(absolute.clone(), self.watches.get(&absolute));
-                let result = self.add_single_watch(path, true, is_user_watch && depth == 0);
+                let path = from.child(absolute.clone());
+                let result = self.add_single_watch(path, roots, is_user_watch && depth == 0);
                 (depth, Some(absolute), result, is_dir)
             }
             Err(err) => {
@@ -582,7 +552,7 @@ impl EventLoop {
                 let absolute = err.path().map(Path::to_path_buf);
                 let requested = absolute
                     .as_ref()
-                    .map(|path| roots.entry(path.clone(), self.watches.get(path)).requested);
+                    .map(|path| from.child(path.clone()).requested);
                 let error = map_walkdir_error(err).set_paths(requested.into_iter().collect());
                 (depth, absolute, Err(error), false)
             }
@@ -595,13 +565,13 @@ impl EventLoop {
         Ok(skip_directory)
     }
 
-    /// Adds a single watch to the kqueue.
+    /// Adds `roots` to the user watches that cover `path`, and watches `path`.
     ///
     /// The caller of this function must call `self.kqueue.watch()` afterwards to register the new watch.
     fn add_single_watch(
         &mut self,
         path: WatchPath,
-        is_recursive: bool,
+        roots: &[Arc<Path>],
         is_user_watch: bool,
     ) -> Result<()> {
         // add_filename opens the path for reading, which can block on a FIFO. Check the
@@ -624,6 +594,15 @@ impl EventLoop {
             return Ok(());
         }
 
+        let mut watch = self
+            .watches
+            .get(&path.absolute)
+            .cloned()
+            .unwrap_or_default();
+        for root in roots {
+            watch.add_root(&path.absolute, root, &self.user_roots);
+        }
+
         let event_filter = EventFilter::EVFILT_VNODE;
         let filter_flags = FilterFlag::NOTE_DELETE
             | FilterFlag::NOTE_WRITE
@@ -638,64 +617,96 @@ impl EventLoop {
         self.kqueue
             .add_filename(&path.absolute, event_filter, filter_flags)
             .map_err(|e| map_kqueue_io_error(e).add_path(path.requested.clone()))?;
-        let existing_watch = self.watches.get(&path.absolute);
-        let watch = Watch::new(&path, is_recursive, is_user_watch, existing_watch);
         self.watches.insert(path.absolute, watch);
 
         Ok(())
     }
 
+    /// Removes the user watch on `path`, or the entries below a directory that is gone.
+    ///
+    /// Without `remove_recursive`, an `unwatch` of a user watch removes that watch from the
+    /// entries it covers, and the entries that another user watch covers stay. An `unwatch` of
+    /// an entry that only a walk added stops the user watches above it from covering it. With
+    /// `remove_recursive`, the entry was deleted or moved away, so every entry below it is
+    /// removed, including the user watches.
     fn remove_watch(&mut self, path: PathBuf, remove_recursive: bool) -> Result<()> {
         log::trace!("removing kqueue watch: {}", path.display());
+        // An entry that no user watch covers only has a watch that keeps new-entry discovery
+        // from adding it again. The user does not watch it, so an unwatch of it fails.
+        if !self
+            .watches
+            .get(&path)
+            .is_some_and(|watch| remove_recursive || !watch.roots.is_empty())
+        {
+            return Err(Error::watch_not_found());
+        }
 
-        let preserved_roots = preserved_watch_roots(&path, remove_recursive, self.watches.iter());
+        let drops = remove_user_roots(&mut self.user_roots, &path, remove_recursive);
 
-        match self.watches.remove(&path) {
-            None => return Err(Error::watch_not_found()),
-            Some(watch) => {
-                if watch.is_recursive || remove_recursive {
-                    self.kqueue
-                        .remove_filename(&path, EventFilter::EVFILT_VNODE)
-                        .map_err(|e| Error::io(e).add_path(path.clone()))?;
-
-                    let mut remove_list = Vec::new();
-                    let mut reset_list = Vec::new();
-                    for p in self.watches.keys().filter(|p| p.starts_with(&path)) {
-                        if let Some(user_is_recursive) = preserved_watch_mode(p, &preserved_roots) {
-                            if !user_is_recursive || is_preserved_watch_root(p, &preserved_roots) {
-                                reset_list.push(p.clone());
-                            }
-                            continue;
-                        }
-
-                        remove_list.push(p.clone());
-                    }
-
-                    for p in &remove_list {
-                        self.kqueue
-                            .remove_filename(p, EventFilter::EVFILT_VNODE)
-                            .map_err(|e| Error::io(e).add_path(p.clone()))?;
-                    }
-                    for p in remove_list {
-                        self.watches.remove(&p);
-                    }
-                    for p in reset_list {
-                        if let Some(watch) = self.watches.get_mut(&p) {
-                            watch.is_recursive = watch.user_is_recursive;
-                        }
-                    }
-                } else {
-                    self.kqueue
-                        .remove_filename(&path, EventFilter::EVFILT_VNODE)
-                        .map_err(|e| Error::io(e).add_path(path.clone()))?;
+        let mut candidates: Vec<_> = self
+            .watches
+            .keys()
+            .filter(|candidate| candidate.starts_with(&path))
+            .cloned()
+            .collect();
+        // A parent sorts before its descendants, so the state of the parent is final when a
+        // descendant is checked.
+        candidates.sort();
+        let mut result = Ok(());
+        for candidate in candidates {
+            let mut watch = self
+                .watches
+                .remove(&candidate)
+                .expect("candidate is watched");
+            let was_uncovered = watch.roots.is_empty();
+            watch.roots.retain(|root| !drops(root));
+            watch.refresh(&candidate, &self.user_roots);
+            if !watch.roots.is_empty() {
+                self.watches.insert(candidate, watch);
+                continue;
+            }
+            // No user watch covers the entry any more, but new-entry discovery still looks for
+            // new entries in its parent. The entry keeps a watch with `UNCOVERED_FLAGS`, so
+            // discovery does not add it again. If the entry cannot be opened again, it is
+            // removed.
+            let parent = candidate
+                .parent()
+                .and_then(|parent| Some((parent, self.watches.get(parent)?)))
+                .filter(|(parent, watch)| {
+                    !remove_recursive && self.discovers_new_entries(parent, watch)
+                });
+            if let Some((parent, parent_watch)) = parent {
+                watch.reported_path =
+                    reported_path(parent, &parent_watch.reported_path, &candidate);
+                if was_uncovered
+                    || self
+                        .kqueue
+                        .add_filename(&candidate, EventFilter::EVFILT_VNODE, UNCOVERED_FLAGS)
+                        .is_ok()
+                {
+                    self.watches.insert(candidate, watch);
+                    continue;
                 }
-
-                self.kqueue.watch()?;
+            }
+            if let Err(err) = self
+                .kqueue
+                .remove_filename(&candidate, EventFilter::EVFILT_VNODE)
+            {
+                // The other entries are still updated, and the first error is returned.
+                result = result.and(Err(Error::io(err).add_path(candidate)));
             }
         }
-        Ok(())
+
+        self.kqueue.watch()?;
+        result
     }
 }
+
+/// The flags of a watch on an entry that no user watch covers. The watch only reports the
+/// deletion, the rename and the revocation of the entry itself.
+const UNCOVERED_FLAGS: FilterFlag = FilterFlag::NOTE_DELETE
+    .union(FilterFlag::NOTE_RENAME)
+    .union(FilterFlag::NOTE_REVOKE);
 
 fn map_walkdir_error(e: walkdir::Error) -> Error {
     if e.io_error().is_some() {
@@ -892,7 +903,7 @@ mod tests {
         let dir = testdir();
         let (mut event_loop, rx) = recording_event_loop();
         let root = WatchPath::from_parts(dir.path().join("missing"), "reported/missing".into());
-        let error = event_loop.add_watch(root, true, true).unwrap_err();
+        let error = event_loop.add_watch(root, true).unwrap_err();
         assert!(matches!(error.kind, ErrorKind::PathNotFound));
         assert_eq!(error.paths, [PathBuf::from("reported/missing")]);
         assert!(event_loop.watches.is_empty());
@@ -909,7 +920,7 @@ mod tests {
         let (mut event_loop, rx) = recording_event_loop();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
         let readable = std::fs::read_dir(&root).is_ok();
-        let result = event_loop.add_watch(WatchPath::new(&root).unwrap(), true, true);
+        let result = event_loop.add_watch(WatchPath::new(&root).unwrap(), true);
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
         if readable {
             return;
@@ -942,16 +953,17 @@ mod tests {
 
         // Keep WalkDir's actual root/read-error sequence, but let opening the root succeed.
         // This reproduces a deferred read failure without racing a permission-changing thread.
-        let mut roots = WalkRoots::new(WatchPath::from_parts(root.clone(), "reported".into()));
+        let from = WatchPath::from_parts(root.clone(), "reported".into());
+        let roots = [Arc::from(root.as_path())];
         let mut errors = WatchErrors::default();
         assert!(
             !event_loop
-                .add_walk_entry(entry.unwrap(), &mut roots, true, &mut errors)
+                .add_walk_entry(entry.unwrap(), &from, &roots, true, &mut errors)
                 .unwrap()
         );
         assert!(event_loop.watches.contains_key(&root));
         let error = event_loop
-            .add_walk_entry(read_error.unwrap(), &mut roots, true, &mut errors)
+            .add_walk_entry(read_error.unwrap(), &from, &roots, true, &mut errors)
             .unwrap_err();
         assert!(
             matches!(error.kind, ErrorKind::Io(err) if err.kind() == io::ErrorKind::PermissionDenied)
@@ -974,11 +986,7 @@ mod tests {
         let (mut event_loop, rx) = recording_event_loop();
 
         event_loop
-            .add_watch(
-                WatchPath::from_parts(root.into(), "reported".into()),
-                true,
-                true,
-            )
+            .add_watch(WatchPath::from_parts(root.into(), "reported".into()), true)
             .unwrap();
         let errors: Vec<_> = rx.try_iter().filter_map(Result::err).collect();
         assert_eq!(errors.len(), 1);
@@ -1004,7 +1012,7 @@ mod tests {
                     event_loop.follow_symlinks = follow_symlinks;
                     if triggered_by_event {
                         event_loop
-                            .add_watch(WatchPath::new(root).unwrap(), true, true)
+                            .add_watch(WatchPath::new(root).unwrap(), true)
                             .unwrap();
                     }
 
@@ -1027,7 +1035,7 @@ mod tests {
                         event_loop.handle_kqueue();
                     } else {
                         event_loop
-                            .add_watch(WatchPath::new(root).unwrap(), true, true)
+                            .add_watch(WatchPath::new(root).unwrap(), true)
                             .unwrap();
                     }
                     for path in [
@@ -1095,7 +1103,6 @@ mod tests {
                         .add_watch(
                             WatchPath::from_parts(path.clone(), "reported".into()),
                             is_recursive,
-                            true,
                         )
                         .unwrap_err();
                     assert!(
@@ -1121,7 +1128,7 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let readable = std::fs::File::open(&locked).is_ok();
 
-        let result = event_loop.add_watch(WatchPath::new(root).unwrap(), true, true);
+        let result = event_loop.add_watch(WatchPath::new(root).unwrap(), true);
         let initial: Vec<_> = rx.try_iter().filter_map(Result::err).collect();
         let created = std::fs::write(root.join("first"), "");
         event_loop.handle_kqueue();
@@ -1159,7 +1166,7 @@ mod tests {
         let (mut event_loop, rx) = recording_event_loop();
         event_loop.event_kinds = EventKindMask::empty();
         event_loop
-            .add_watch(WatchPath::new(&root).unwrap(), true, true)
+            .add_watch(WatchPath::new(&root).unwrap(), true)
             .unwrap();
         std::fs::write(root.join("file"), "").unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -1214,7 +1221,7 @@ mod tests {
             let (mut event_loop, rx) = recording_event_loop();
             if triggered_by_event {
                 event_loop
-                    .add_watch(WatchPath::new(root).unwrap(), true, true)
+                    .add_watch(WatchPath::new(root).unwrap(), true)
                     .unwrap();
             }
             for index in 0..128 {
@@ -1226,7 +1233,7 @@ mod tests {
                 event_loop.handle_kqueue();
                 Ok(())
             } else {
-                event_loop.add_watch(WatchPath::new(root).unwrap(), true, true)
+                event_loop.add_watch(WatchPath::new(root).unwrap(), true)
             };
             drop(restore);
 
@@ -1261,7 +1268,7 @@ mod tests {
         for root in &roots {
             std::fs::create_dir(root).unwrap();
             event_loop
-                .add_watch(WatchPath::new(root).unwrap(), true, true)
+                .add_watch(WatchPath::new(root).unwrap(), true)
                 .unwrap();
         }
         for root in &roots {
@@ -1345,25 +1352,25 @@ mod tests {
 
         let mut event_loop = test_event_loop()?;
 
-        event_loop.add_watch(WatchPath::new(dir.path())?, true, true)?;
-        event_loop.add_watch(WatchPath::new(&child)?, false, true)?;
+        event_loop.add_watch(WatchPath::new(dir.path())?, true)?;
+        event_loop.add_watch(WatchPath::new(&child)?, false)?;
 
         event_loop.remove_watch(dir.path().to_path_buf(), false)?;
         assert!(
             event_loop
                 .watches
                 .get(&child)
-                .is_some_and(|watch| watch.is_user_watch && !watch.user_is_recursive),
+                .is_some_and(|watch| watch.is_user_watch)
+                && !event_loop.user_roots[child.as_path()].is_recursive,
             "internal refresh removed explicit child watch"
         );
 
-        event_loop.add_watch(WatchPath::new(dir.path())?, true, true)?;
+        event_loop.add_watch(WatchPath::new(dir.path())?, true)?;
 
         let watched: HashMap<_, _> = event_loop
-            .watches
+            .user_roots
             .iter()
-            .filter(|(_path, watch)| watch.is_user_watch)
-            .map(|(path, watch)| (path.clone(), watch.user_is_recursive))
+            .map(|(path, root)| (path.to_path_buf(), root.is_recursive))
             .collect();
         assert_eq!(watched.get(dir.path()), Some(&true));
         assert_eq!(watched.get(&child), Some(&false));
@@ -1375,7 +1382,7 @@ mod tests {
     fn write_watches_every_new_entry() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let mut event_loop = test_event_loop()?;
-        event_loop.add_watch(WatchPath::new(dir.path())?, true, true)?;
+        event_loop.add_watch(WatchPath::new(dir.path())?, true)?;
 
         // The NOTE_WRITE handler reports only the first new entry it finds as created. All new
         // entries and the contents of new subdirectories still need a watch.
@@ -1399,7 +1406,7 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let (mut event_loop, rx) = recording_event_loop();
-        event_loop.add_watch(WatchPath::new(dir.path())?, true, true)?;
+        event_loop.add_watch(WatchPath::new(dir.path())?, true)?;
 
         let child = dir.path().join("child");
         let cycle = child.join("cycle");
@@ -1431,7 +1438,7 @@ mod tests {
         let child = dir.path().join("child");
         std::fs::create_dir(&child)?;
         let mut event_loop = test_event_loop()?;
-        event_loop.add_watch(WatchPath::new(dir.path())?, true, true)?;
+        event_loop.add_watch(WatchPath::new(dir.path())?, true)?;
 
         std::fs::remove_dir(&child)?;
         std::fs::create_dir(&child)?;
@@ -1454,7 +1461,7 @@ mod tests {
         let child = dir.path().join("child");
         std::fs::create_dir(&child)?;
         let mut event_loop = test_event_loop()?;
-        event_loop.add_watch(WatchPath::new(dir.path())?, true, true)?;
+        event_loop.add_watch(WatchPath::new(dir.path())?, true)?;
 
         std::fs::remove_dir(&child)?;
         std::fs::write(&child, "")?;
@@ -1472,7 +1479,7 @@ mod tests {
     {
         let dir = tempfile::tempdir()?;
         let mut event_loop = test_event_loop()?;
-        event_loop.add_watch(WatchPath::new(dir.path())?, false, true)?;
+        event_loop.add_watch(WatchPath::new(dir.path())?, false)?;
 
         let child = dir.path().join("child");
         std::fs::create_dir(&child)?;
@@ -1481,7 +1488,7 @@ mod tests {
         assert!(!event_loop.watches.contains_key(&child));
         let watch = event_loop.watches.get(dir.path()).expect("root watch");
         assert!(!watch.is_recursive);
-        assert!(!watch.user_is_recursive);
+        assert!(!event_loop.user_roots[dir.path()].is_recursive);
 
         Ok(())
     }
@@ -1495,7 +1502,7 @@ mod tests {
 
         let mut event_loop = test_event_loop()?;
 
-        event_loop.add_watch(WatchPath::new(dir.path())?, true, true)?;
+        event_loop.add_watch(WatchPath::new(dir.path())?, true)?;
         assert!(event_loop.watches.contains_key(&child));
 
         std::fs::remove_file(&child)?;
@@ -1519,7 +1526,7 @@ mod tests {
         let readable = std::fs::read_dir(&locked).is_ok();
 
         let (mut event_loop, rx) = recording_event_loop();
-        let result = event_loop.add_watch(WatchPath::new(dir.path())?, true, true);
+        let result = event_loop.add_watch(WatchPath::new(dir.path())?, true);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))?;
         // root can open the directory anyway, so the walk does not fail.
         if readable {
@@ -1551,14 +1558,14 @@ mod tests {
 
         let mut event_loop = test_event_loop()?;
 
-        event_loop.add_watch(WatchPath::new(dir.path())?, true, true)?;
+        event_loop.add_watch(WatchPath::new(dir.path())?, true)?;
         assert!(event_loop.watches.contains_key(&child));
 
-        event_loop.add_watch(WatchPath::new(dir.path())?, false, true)?;
+        event_loop.add_watch(WatchPath::new(dir.path())?, false)?;
 
         let watch = event_loop.watches.get(dir.path()).expect("root watch");
         assert!(watch.is_user_watch);
-        assert!(!watch.user_is_recursive);
+        assert!(!event_loop.user_roots[dir.path()].is_recursive);
         assert!(!watch.is_recursive);
         assert!(!event_loop.watches.contains_key(&child));
 
@@ -1575,22 +1582,17 @@ mod tests {
 
         let (mut event_loop, rx) = recording_event_loop();
 
-        event_loop.add_watch(WatchPath::new(dir.path())?, true, true)?;
-        event_loop.add_watch(WatchPath::new(&child)?, false, true)?;
-        let cycle = child.join("cycle");
-        std::os::unix::fs::symlink(".", &cycle)?;
+        event_loop.add_watch(WatchPath::new(dir.path())?, true)?;
+        event_loop.add_watch(WatchPath::new(&child)?, false)?;
         event_loop.add_watch(
             WatchPath::from_parts(child.clone(), PathBuf::from("reported-child")),
             false,
-            true,
         )?;
-        let errors: Vec<_> = rx.try_iter().filter_map(Result::err).collect();
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].paths, [cycle]);
+        assert!(rx.try_iter().all(|event| event.is_ok()));
 
         let child_watch = event_loop.watches.get(&child).expect("child watch");
         assert!(child_watch.is_user_watch);
-        assert!(!child_watch.user_is_recursive);
+        assert!(!event_loop.user_roots[child.as_path()].is_recursive);
         assert!(child_watch.is_recursive);
         assert_eq!(child_watch.reported_path, PathBuf::from("reported-child"));
 
@@ -1600,6 +1602,25 @@ mod tests {
             .expect("grandchild still covered by recursive parent");
         assert!(!grandchild_watch.is_user_watch);
         assert!(grandchild_watch.is_recursive);
+
+        Ok(())
+    }
+
+    #[test]
+    fn unwatching_a_nested_watch_keeps_the_coverage_of_the_outer_watch()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let child = dir.path().join("child");
+        let grandchild = child.join("grandchild");
+        std::fs::create_dir_all(&grandchild)?;
+
+        let mut event_loop = test_event_loop()?;
+        event_loop.add_watch(WatchPath::new(dir.path())?, true)?;
+        event_loop.add_watch(WatchPath::new(&child)?, false)?;
+        event_loop.remove_watch(child.clone(), false)?;
+
+        assert!(event_loop.watches.contains_key(&child));
+        assert!(event_loop.watches.contains_key(&grandchild));
 
         Ok(())
     }
@@ -1617,9 +1638,8 @@ mod tests {
         event_loop.add_watch(
             WatchPath::from_parts(child.clone(), PathBuf::from("reported-child")),
             true,
-            true,
         )?;
-        event_loop.add_watch(WatchPath::new(dir.path())?, true, true)?;
+        event_loop.add_watch(WatchPath::new(dir.path())?, true)?;
 
         let reported = |event_loop: &EventLoop, path: &Path| {
             let watch = event_loop.watches.get(path).expect("watch");
@@ -1652,22 +1672,90 @@ mod tests {
 
         let mut event_loop = test_event_loop()?;
 
-        event_loop.add_watch(WatchPath::new(dir.path())?, true, true)?;
+        event_loop.add_watch(WatchPath::new(dir.path())?, true)?;
         event_loop.remove_watch(child.clone(), false)?;
-        event_loop.add_watch(WatchPath::new(&child)?, false, true)?;
+        event_loop.add_watch(WatchPath::new(&child)?, false)?;
         event_loop.add_watch(
             WatchPath::from_parts(child.clone(), PathBuf::from("reported-child")),
             false,
-            true,
         )?;
 
         let child_watch = event_loop.watches.get(&child).expect("child watch");
         assert!(child_watch.is_user_watch);
-        assert!(!child_watch.user_is_recursive);
+        assert!(!event_loop.user_roots[child.as_path()].is_recursive);
         assert!(!child_watch.is_recursive);
         assert_eq!(child_watch.reported_path, PathBuf::from("reported-child"));
         assert!(!event_loop.watches.contains_key(&grandchild));
 
+        Ok(())
+    }
+
+    #[test]
+    fn an_unwatched_file_that_a_walk_added_is_not_discovered_again()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"content")?;
+
+        let mut event_loop = test_event_loop()?;
+        event_loop.add_watch(WatchPath::new(dir.path())?, true)?;
+        event_loop.remove_watch(file.clone(), false)?;
+
+        // A new entry makes the parent post NOTE_WRITE, and discovery runs.
+        std::fs::write(dir.path().join("new"), b"content")?;
+        std::thread::sleep(Duration::from_millis(100));
+        event_loop.handle_kqueue();
+
+        let watch = event_loop.watches.get(&file).expect("uncovered watch");
+        assert!(watch.roots.is_empty());
+        assert!(event_loop.watches.contains_key(&dir.path().join("new")));
+        Ok(())
+    }
+
+    #[test]
+    fn an_unwatched_directory_that_cannot_be_opened_is_removed()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child)?;
+
+        let mut event_loop = test_event_loop()?;
+        event_loop.add_watch(WatchPath::new(dir.path())?, true)?;
+        // The watch of `child` cannot be opened again as the watch of an uncovered entry.
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o000))?;
+        let result = event_loop.remove_watch(child.clone(), false);
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o755))?;
+
+        result?;
+        assert!(!event_loop.watches.contains_key(&child));
+        assert!(event_loop.remove_watch(child.clone(), false).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unwatching_a_link_that_a_walk_does_not_follow_removes_the_entries_below_it()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("root");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir_all(target.join("sub"))?;
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        // The test event loop does not follow symbolic links.
+        let mut event_loop = test_event_loop()?;
+        event_loop.add_watch(WatchPath::new(&root)?, true)?;
+        // walkdir follows the root of a walk, so this watch reaches `link/sub`.
+        event_loop.add_watch(WatchPath::new(&link)?, true)?;
+        assert!(event_loop.watches.contains_key(&link.join("sub")));
+        event_loop.remove_watch(link.clone(), false)?;
+
+        // Discovery does not run for an unfollowed link, so `link/sub` needs no watch.
+        assert!(!event_loop.watches.contains_key(&link.join("sub")));
         Ok(())
     }
 
