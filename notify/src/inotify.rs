@@ -1101,11 +1101,14 @@ impl EventLoop {
         };
         let previous_descriptor = existing_watch.map(|watch| watch.watch_descriptor.clone());
 
-        let mut add_mask = watchmask;
         if let Some(watch) = existing_watch {
             watchmask.insert(watch.watch_mask);
-            add_mask = watchmask | WatchMask::MASK_ADD;
         }
+        // Another path can watch the same inode, for example a walk that followed a symlink,
+        // and inotify then returns the descriptor of that watch. Without `IN_MASK_ADD`, the new
+        // mask replaces the mask of the other path. The other path then stops receiving the
+        // events that only it requested.
+        let mut add_mask = watchmask | WatchMask::MASK_ADD;
         if !dereference {
             add_mask.insert(WatchMask::DONT_FOLLOW);
         }
@@ -2181,6 +2184,46 @@ mod tests {
         ignore = "FreeBSD 15.1 does not generate IN_IGNORED unconditionally"
     )]
     #[test]
+    fn deleting_a_directory_that_a_walk_reached_through_a_link_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("outer");
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir(&outer).unwrap();
+        std::fs::create_dir(&shared).unwrap();
+        std::os::unix::fs::symlink(&shared, outer.join("link")).unwrap();
+
+        let (mut event_loop, rx) = test_event_loop_with_events();
+        event_loop
+            .add_watch(
+                WatchPath::new(&shared).unwrap(),
+                non_recursive_watch(),
+                true,
+                false,
+            )
+            .unwrap();
+        // The walk reaches `shared` again through `outer/link` and adds the same inode.
+        event_loop
+            .add_watch(
+                WatchPath::new(&outer).unwrap(),
+                recursive_watch(),
+                true,
+                false,
+            )
+            .unwrap();
+
+        std::fs::remove_dir(&shared).unwrap();
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(50));
+            event_loop.handle_inotify();
+        }
+        let removed = rx
+            .try_iter()
+            .filter_map(Result::ok)
+            .any(|event| event.kind.is_remove());
+        assert!(removed, "deleting the watched directory must be reported");
+    }
+
+    #[test]
     fn deleting_a_directory_shared_through_a_link_removes_every_path() {
         let tmp = tempfile::tempdir().unwrap();
         let outer = tmp.path().join("outer");
@@ -2190,7 +2233,7 @@ mod tests {
         let link = outer.join("link");
         std::os::unix::fs::symlink(&shared, &link).unwrap();
 
-        let (mut event_loop, _rx) = test_event_loop_with_events();
+        let (mut event_loop, rx) = test_event_loop_with_events();
         event_loop
             .add_watch(
                 WatchPath::new(&shared).unwrap(),
@@ -2220,6 +2263,14 @@ mod tests {
             remaining,
             [outer],
             "the deleted directory must not stay watched under any of its paths"
+        );
+        let removed = rx
+            .try_iter()
+            .filter_map(Result::ok)
+            .any(|event| event.kind.is_remove() && event.paths == [shared.clone()]);
+        assert!(
+            removed,
+            "the user watch of the deleted directory must report it under its own path"
         );
     }
 
@@ -2264,6 +2315,50 @@ mod tests {
             .collect();
         removed.sort();
         assert_eq!(removed, [first, second]);
+    }
+
+    #[test]
+    fn unwatching_a_shared_directory_stops_reporting_its_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("outer");
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir(&outer).unwrap();
+        std::fs::create_dir(&shared).unwrap();
+        let link = outer.join("link");
+        std::os::unix::fs::symlink(&shared, &link).unwrap();
+
+        let (mut event_loop, rx) = test_event_loop_with_events();
+        event_loop
+            .add_watch(
+                WatchPath::new(&shared).unwrap(),
+                non_recursive_watch(),
+                true,
+                false,
+            )
+            .unwrap();
+        event_loop
+            .add_watch(
+                WatchPath::new(&outer).unwrap(),
+                recursive_watch(),
+                true,
+                false,
+            )
+            .unwrap();
+        event_loop.remove_watch(shared.clone(), false).unwrap();
+
+        // Only the user watch of `shared` requested `IN_DELETE_SELF`. `outer/link` itself still
+        // exists, so its deletion must not be reported.
+        std::fs::remove_dir(&shared).unwrap();
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(50));
+            event_loop.handle_inotify();
+        }
+        let removed: Vec<_> = rx
+            .try_iter()
+            .filter_map(Result::ok)
+            .filter(|event| event.kind.is_remove())
+            .collect();
+        assert!(removed.is_empty(), "{removed:?}");
     }
 
     #[test]
