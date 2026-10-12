@@ -565,6 +565,10 @@ impl EventAttributes {
     /// For example, the inotify backend uses a rename cookie to associate [`RenameMode::From`]
     /// and [`RenameMode::To`] events for the same rename. If it also emits a [`RenameMode::Both`]
     /// event, that event has the same ID.
+    /// When several watches reach the renamed file, for example through a symbolic link, inotify
+    /// reports the rename once for each watch. Every [`RenameMode::From`], [`RenameMode::To`] and
+    /// [`RenameMode::Both`] event of the rename has the same ID. Pair a [`RenameMode::From`] event
+    /// with the [`RenameMode::To`] event below the same watch.
     ///
     /// Use this value to match related events from the same watcher. Treat it as an opaque value:
     /// its meaning and lifetime depend on the backend, and it is not a persistent file identifier

@@ -15,6 +15,7 @@
 - DOCS: explain partial recursive kqueue coverage and file descriptor limits, and recommend FSEvents for large trees on macOS
 - PERF: [Windows] wait for the wakeup semaphore without a timeout, so an idle watcher no longer wakes 10 times a second; `Watcher::configure` now wakes the server instead of waiting for the timeout, and the semaphore stays open until both the watcher and the server are done with it
 - FIX: [inotify] report a symbolic link in a new directory that points to a directory above it as a loop, instead of watching the tree a second time below the link
+- FIX: [inotify] report a change in a directory or file that two watches share through a symlink or a hard link under the path of each watch, and watch the new subdirectories of such a directory for every recursive watch. A rename in such a directory is reported once for each watch, and all of its events have the same tracker
 
 [#703]: https://github.com/notify-rs/notify/issues/703
 [#455]: https://github.com/notify-rs/notify/issues/455
