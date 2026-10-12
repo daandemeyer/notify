@@ -244,6 +244,51 @@ impl<T: FileIdCache> DebounceDataInner<T> {
         }
     }
 
+    /// Removes the root at `path` after the watcher unwatched `path`.
+    fn remove_root(&mut self, path: &Path) {
+        let len = self.roots.len();
+        self.roots.retain(|root| root.path.as_path() != path);
+        if self.roots.len() != len {
+            self.refresh_cache_under(path);
+            return;
+        }
+        // inotify and kqueue also unwatch a directory that the walk of a recursive root added.
+        // The root then stops covering the entries below the directory. The parent of the
+        // directory still reports the directory itself.
+        self.cache.remove_path(path);
+        self.cache.add_single_path(path);
+        self.add_nested_roots(path);
+    }
+
+    /// Drops the cached IDs at and below `path` and fingerprints `path` again for the roots
+    /// that still cover it.
+    fn refresh_cache_under(&mut self, path: &Path) {
+        self.cache.remove_path(path);
+        // A recursive root above `path` still covers it, and the removal also dropped the IDs
+        // that this root needs.
+        let is_covered = self
+            .roots
+            .iter()
+            .any(|root| path.starts_with(&root.path) && reports(root, path));
+        if is_covered {
+            self.add_event_path(path);
+        }
+        self.add_nested_roots(path);
+    }
+
+    /// Fingerprints the roots below `path` again after their IDs were removed with `path`.
+    fn add_nested_roots(&mut self, path: &Path) {
+        let nested_roots: Vec<_> = self
+            .roots
+            .iter()
+            .filter(|root| root.path.starts_with(path) && root.path != path)
+            .cloned()
+            .collect();
+        for root in nested_roots {
+            self.cache.add_path(&root.path, root.recursive_mode);
+        }
+    }
+
     /// Retrieve a vec of debounced events, removing them if not continuous
     pub fn debounced_events(&mut self) -> Vec<DebouncedEvent> {
         let now = now();
@@ -696,25 +741,9 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
     }
 
     fn remove_root(&mut self, path: impl AsRef<Path>) {
-        let mut data = self.data.inner.lock().unwrap();
-        let path = path.as_ref();
-
         // Unwatching a path only removes that watch, so roots nested under it are still
-        // watched and must keep their bookkeeping. Their cached IDs go away with the
-        // subtree drop below, so re-fingerprint each survivor afterwards.
-        let surviving_nested_roots: Vec<_> = data
-            .roots
-            .iter()
-            .filter(|root| root.path.starts_with(path) && root.path.as_path() != path)
-            .cloned()
-            .collect();
-
-        data.roots.retain(|root| root.path.as_path() != path);
-
-        data.cache.remove_path(path);
-        for root in surviving_nested_roots {
-            data.cache.add_path(&root.path, root.recursive_mode);
-        }
+        // watched and must keep their bookkeeping.
+        self.data.inner.lock().unwrap().remove_root(path.as_ref());
     }
 
     pub fn watch(
@@ -948,6 +977,14 @@ fn root_at<'a>(roots: &'a VecDeque<WatchRoot>, path: &Path) -> Option<&'a WatchR
         .binary_search_by(|root| root.path.as_path().cmp(path))
         .ok()?;
     Some(&roots[index])
+}
+
+/// Returns whether the watch on `root` reports changes to `path`, which is `root.path` or below
+/// it. A non-recursive watch reports its root and the direct children of its root.
+fn reports(root: &WatchRoot, path: &Path) -> bool {
+    root.recursive_mode == RecursiveMode::Recursive
+        || root.path == path
+        || path.parent() == Some(root.path.as_path())
 }
 
 fn sort_events(events: Vec<DebouncedEvent>) -> Vec<DebouncedEvent> {
@@ -1976,6 +2013,71 @@ mod tests {
         assert!(
             !grandchild_cached,
             "the non-recursive root does not watch the entries below its children"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn unwatching_a_nested_root_keeps_the_ids_of_an_outer_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut debouncer = tracking_debouncer(FileIdMap::new())?;
+
+        let tmpdir = tempdir()?;
+        let inner = tmpdir.path().join("inner");
+        let deep = inner.join("sub").join("deep.txt");
+        fs::create_dir_all(deep.parent().unwrap())?;
+        fs::write(&deep, b"content")?;
+
+        debouncer.watch(tmpdir.path(), RecursiveMode::Recursive)?;
+        debouncer.watch(&inner, RecursiveMode::Recursive)?;
+        debouncer.unwatch(&inner)?;
+        let after_unwatch = debouncer
+            .data
+            .inner
+            .lock()
+            .unwrap()
+            .cache
+            .cached_file_id(&deep)
+            .is_some();
+
+        assert!(
+            after_unwatch,
+            "the outer recursive root still covers `inner` after the unwatch"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn unwatching_a_walked_directory_drops_the_ids_below_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut debouncer = tracking_debouncer(FileIdMap::new())?;
+
+        let tmpdir = tempdir()?;
+        let sub = tmpdir.path().join("sub");
+        let deep = sub.join("deep.txt");
+        fs::create_dir(&sub)?;
+        fs::write(&deep, b"content")?;
+
+        debouncer.watch(tmpdir.path(), RecursiveMode::Recursive)?;
+        // `TrackingWatcher` only unwatches its roots, so remove the walked directory the way
+        // inotify and kqueue do after their unwatch.
+        let (sub_cached, deep_cached) = {
+            let mut data = debouncer.data.inner.lock().unwrap();
+            data.remove_root(&sub);
+            (
+                data.cache.cached_file_id(&sub).is_some(),
+                data.cache.cached_file_id(&deep).is_some(),
+            )
+        };
+
+        assert!(sub_cached, "the root still reports `sub` itself");
+        assert!(
+            !deep_cached,
+            "the root stops covering the entries below an unwatched directory"
         );
 
         Ok(())
