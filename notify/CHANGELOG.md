@@ -18,6 +18,7 @@
 - FIX: [inotify] report a change in a directory or file that two watches share through a symlink or a hard link under the path of each watch, and watch the new subdirectories of such a directory for every recursive watch. A rename in such a directory is reported once for each watch, and all of its events have the same tracker
 - FIX: [inotify] drop the watch below a followed symbolic link that a rename replaces, so the changes of its old target are no longer reported under its path
 - FIX: [inotify] report the deletion of a watched directory that a recursive walk also reaches through a symlink
+- FIX: [inotify] keep the watch of another path on the same inode when a watch fails because its path was deleted
 
 [#703]: https://github.com/notify-rs/notify/issues/703
 [#455]: https://github.com/notify-rs/notify/issues/455

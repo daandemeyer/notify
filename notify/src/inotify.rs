@@ -1153,8 +1153,11 @@ impl EventLoop {
                             Ok(metadata) => metadata.is_dir(),
                             Err(e) => {
                                 // Avoid leaking an inotify watch if we can't stat after adding it.
-                                // This can happen due to racy deletions.
-                                let _ = inotify.watches().remove(w.clone());
+                                // This can happen due to racy deletions. A watch that another path
+                                // uses stays for that path.
+                                if !self.paths.contains_key(&w) {
+                                    let _ = inotify.watches().remove(w.clone());
+                                }
                                 return Err(Error::io_watch(e).add_path(path.requested));
                             }
                         }
