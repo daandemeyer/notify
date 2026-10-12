@@ -22,6 +22,8 @@
 - FIX: [inotify] [kqueue] keep watching the directories below a watch inside a recursive watch when the inner watch is unwatched
 - FIX: [kqueue] keep a path that a recursive watch reached unwatched after `unwatch`, instead of watching it again on the next write to its parent directory. A path that kqueue cannot open again is watched again once it can be opened
 - FIX: [inotify] a recursive watch reports the changes below a symbolic link again after a watch on the link without dereference is unwatched or rewatched with dereference
+- FIX: [kqueue] do not watch below a new symbolic link to a directory when `follow_symlinks` is disabled
+- FIX: [kqueue] watch the entries that are created directly in the target of a recursively watched symbolic link when `follow_symlinks` is disabled
 
 [#703]: https://github.com/notify-rs/notify/issues/703
 [#455]: https://github.com/notify-rs/notify/issues/455

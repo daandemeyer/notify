@@ -21,12 +21,18 @@ impl WatchPath {
 
 /// Returns `path` without a trailing separator. `lstat` follows a symbolic link when the path
 /// ends with a separator.
-#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn without_trailing_separator(path: &Path) -> PathBuf {
     match (path.parent(), path.file_name()) {
         (Some(parent), Some(name)) => parent.join(name),
         _ => path.to_path_buf(),
     }
+}
+
+/// Returns whether `path` is a symbolic link, also when `path` ends with a separator.
+#[allow(dead_code)]
+pub(crate) fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(without_trailing_separator(path))
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
 }
 
 pub(crate) fn absolute_path(path: &Path) -> Result<PathBuf> {

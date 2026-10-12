@@ -8,7 +8,7 @@ use super::event::*;
 use super::{
     Config, Error, ErrorKind, EventHandler, EventKindMask, RecursiveMode, Result, Watcher,
 };
-use crate::paths::{WatchPath, absolute_path, reported_path};
+use crate::paths::{WatchPath, absolute_path, is_symlink, reported_path};
 use crate::walk::{
     WalkFailure,
     recursive::{
@@ -209,6 +209,10 @@ impl EventLoop {
                     let event_path = watch
                         .map(|watch| watch.reported_path.clone())
                         .unwrap_or_else(|| path.clone());
+                    let discovering_roots = match (&data, watch) {
+                        (kqueue::Vnode::Write, Some(watch)) => self.discovering_roots(&path, watch),
+                        _ => Vec::new(),
+                    };
                     let event = match data {
                         // kqueue does not report the deleted entry's type, and watches
                         // do not retain it, so removals use RemoveKind::Any.
@@ -222,19 +226,11 @@ impl EventLoop {
                         // children, so guessing from read_dir would be unreliable.
                         // Non-recursive watches report the directory's data change instead.
                         // Context: https://github.com/notify-rs/notify/issues/644
-                        kqueue::Vnode::Write
-                            if watch
-                                .is_some_and(|watch| self.discovers_new_entries(&path, watch)) =>
-                        {
+                        kqueue::Vnode::Write if !discovering_roots.is_empty() => {
                             if !abort_additions {
-                                let roots: Vec<_> = watch
-                                    .into_iter()
-                                    .flat_map(|watch| watch.recursive_roots(&self.user_roots))
-                                    .cloned()
-                                    .collect();
                                 refresh_dirs.push((
                                     WatchPath::from_parts(path.clone(), event_path.clone()),
-                                    roots,
+                                    discovering_roots,
                                 ));
                             }
                             let error_path = event_path.clone();
@@ -443,16 +439,19 @@ impl EventLoop {
         Ok(paths)
     }
 
-    /// Whether a write to the directory `path` makes new-entry discovery look for new entries
-    /// in it. Discovery runs for a directory that a recursive user watch covers, and without
-    /// `follow_symlinks` not for a symbolic link to a directory.
-    fn discovers_new_entries(&self, path: &Path, watch: &Watch) -> bool {
-        watch.is_recursive
-            && if self.follow_symlinks {
-                path.is_dir()
-            } else {
-                std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
-            }
+    /// Returns the recursive user watches that look for new entries in the directory at `path`.
+    /// A user watch on a link watches the target of the link. The other user watches only look
+    /// below a link with `follow_symlinks`, as their walks do.
+    fn discovering_roots(&self, path: &Path, watch: &Watch) -> Vec<Arc<Path>> {
+        if !watch.is_recursive || !path.is_dir() {
+            return Vec::new();
+        }
+        let follows_link = self.follow_symlinks || !is_symlink(path);
+        watch
+            .recursive_roots(&self.user_roots)
+            .filter(|root| follows_link || ***root == *path)
+            .cloned()
+            .collect()
     }
 
     fn add_watch(&mut self, path: WatchPath, is_recursive: bool) -> Result<()> {
@@ -509,20 +508,25 @@ impl EventLoop {
         result
     }
 
-    /// Adds `roots` to the entries that the walk from `from` reaches. With `is_user_watch`,
-    /// `from` is the path of a user watch, and a failure on it fails the walk.
+    /// Adds `roots` to the entries that their walk from `from` reaches. `from_is_root` is true
+    /// when `from` is the root of the user watch in `roots`, and a failure on `from` then fails
+    /// the walk.
     fn walk(
         &mut self,
         from: WatchPath,
         roots: &[Arc<Path>],
-        is_user_watch: bool,
+        from_is_root: bool,
         errors: &mut WatchErrors,
     ) -> Result<()> {
+        // walkdir follows a symbolic link at the start of the walk unless told otherwise. A user
+        // watch on a link watches its target, but a new link below a watch is only followed
+        // with `follow_symlinks`, like the links that the walk finds.
         let mut walk = WalkDir::new(&from.absolute)
             .follow_links(self.follow_symlinks)
+            .follow_root_links(self.follow_symlinks || from_is_root)
             .into_iter();
         while let Some(entry) = walk.next() {
-            if self.add_walk_entry(entry, &from, roots, is_user_watch, errors)? {
+            if self.add_walk_entry(entry, &from, roots, from_is_root, errors)? {
                 walk.skip_current_dir();
             }
         }
@@ -673,7 +677,7 @@ impl EventLoop {
                 .parent()
                 .and_then(|parent| Some((parent, self.watches.get(parent)?)))
                 .filter(|(parent, watch)| {
-                    !remove_recursive && self.discovers_new_entries(parent, watch)
+                    !remove_recursive && !self.discovering_roots(parent, watch).is_empty()
                 });
             if let Some((parent, parent_watch)) = parent {
                 watch.reported_path =
@@ -1755,6 +1759,76 @@ mod tests {
         event_loop.remove_watch(link.clone(), false)?;
 
         // Discovery does not run for an unfollowed link, so `link/sub` needs no watch.
+        assert!(!event_loop.watches.contains_key(&link.join("sub")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_recursive_watch_on_a_link_finds_new_entries_in_the_target()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target)?;
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        // The test event loop does not follow symbolic links.
+        let mut event_loop = test_event_loop()?;
+        event_loop.add_watch(WatchPath::new(&link)?, true)?;
+        std::fs::write(target.join("new"), b"content")?;
+        std::thread::sleep(Duration::from_millis(100));
+        event_loop.handle_kqueue();
+
+        assert!(event_loop.watches.contains_key(&link.join("new")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_watch_on_a_link_with_a_separator_finds_new_entries_in_the_target()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("root");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir(&target)?;
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        // The test event loop does not follow symbolic links, so the walk of `root` adds `link`
+        // without its target. The watch on `link/` then also covers the entry of `link`.
+        let mut event_loop = test_event_loop()?;
+        event_loop.add_watch(WatchPath::new(&root)?, true)?;
+        let with_separator = PathBuf::from(format!("{}/", link.display()));
+        event_loop.add_watch(WatchPath::new(&with_separator)?, true)?;
+        std::fs::write(target.join("new"), b"content")?;
+        std::thread::sleep(Duration::from_millis(100));
+        event_loop.handle_kqueue();
+
+        assert!(event_loop.watches.contains_key(&link.join("new")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_link_is_not_followed_without_follow_symlinks()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("root");
+        let target = dir.path().join("target");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir_all(target.join("sub"))?;
+
+        // The test event loop does not follow symbolic links.
+        let mut event_loop = test_event_loop()?;
+        event_loop.add_watch(WatchPath::new(&root)?, true)?;
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link)?;
+        std::thread::sleep(Duration::from_millis(100));
+        event_loop.handle_kqueue();
+
+        assert!(event_loop.watches.contains_key(&link));
         assert!(!event_loop.watches.contains_key(&link.join("sub")));
         Ok(())
     }
