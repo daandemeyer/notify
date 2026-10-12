@@ -6,6 +6,7 @@
 - FIX: for an event on a direct child of a non-recursive watch, cache only that entry and not the entries below it, which the watch does not report
 - CHANGE: `FileIdCache::add_single_path` is a required method, and `FileIdCache::add_path` is a provided method that walks the path and calls `add_single_path` for each entry; a custom cache only has to cache single paths **breaking**
 - FIX: unwatching a root inside a recursive root keeps the cached IDs that the outer root still covers
+- FIX: rewatching a path with a different recursive mode updates the mode of the root and refreshes the file ID cache, instead of keeping the old mode
 - FIX: pair the source and the destination of a rename below the same root when the watcher reports the rename once for each watch, for example for two watches that reach one directory through a symlink
 - FIX: unwatching a path no longer deregisters roots nested under it, and re-fingerprints the nested roots whose cached IDs the removal dropped
 - FIX: if the watcher fails to construct, `new_debouncer_opt` no longer leaks the debouncer thread or the event handler [#1040]

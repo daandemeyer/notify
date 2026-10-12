@@ -724,7 +724,16 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
             .roots
             .binary_search_by(|root| root.path.as_path().cmp(path.as_path()))
         {
-            Ok(_) => return, // already registered
+            Ok(pos) => {
+                if data.roots[pos].recursive_mode == recursive_mode {
+                    return;
+                }
+                // A rewatch without recursion leaves cached IDs below the direct children that
+                // no event updates any more.
+                data.roots[pos].recursive_mode = recursive_mode;
+                data.refresh_cache_under(&path);
+                return;
+            }
             Err(pos) => {
                 // `VecDeque::insert` is O(min(pos, len - pos))
                 data.roots.insert(
@@ -2019,6 +2028,65 @@ mod tests {
     }
 
     #[test]
+    fn rewatch_with_a_new_recursive_mode_refingerprints() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut debouncer = tracking_debouncer(testing::TestCache::new(
+            Default::default(),
+            Default::default(),
+        ))?;
+
+        let path = PathBuf::from("root");
+
+        debouncer.watch(&path, RecursiveMode::Recursive)?;
+        debouncer.watch(&path, RecursiveMode::Recursive)?;
+        assert_eq!(
+            debouncer.data.inner.lock().unwrap().cache.add_path_calls,
+            1,
+            "an unchanged rewatch must not re-fingerprint"
+        );
+
+        debouncer.watch(&path, RecursiveMode::NonRecursive)?;
+        let data = debouncer.data.inner.lock().unwrap();
+        assert_eq!(data.cache.add_path_calls, 2);
+        assert_eq!(data.roots[0].recursive_mode, RecursiveMode::NonRecursive);
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn rewatch_without_recursion_drops_the_cached_subtree() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut debouncer = tracking_debouncer(FileIdMap::new())?;
+
+        let tmpdir = tempdir()?;
+        let sub = tmpdir.path().join("sub");
+        fs::create_dir(&sub)?;
+        let deep = sub.join("deep.txt");
+        fs::write(&deep, b"content")?;
+
+        debouncer.watch(tmpdir.path(), RecursiveMode::Recursive)?;
+        debouncer.watch(tmpdir.path(), RecursiveMode::NonRecursive)?;
+
+        // Copy out what the assertions need and release the lock first: a panic while the
+        // guard is held poisons the mutex, and the debouncer's drop then panics too.
+        let (sub_cached, deep_cached) = {
+            let data = debouncer.data.inner.lock().unwrap();
+            (
+                data.cache.cached_file_id(&sub).is_some(),
+                data.cache.cached_file_id(&deep).is_some(),
+            )
+        };
+        assert!(sub_cached, "a direct child stays covered");
+        assert!(
+            !deep_cached,
+            "a rewatch without recursion must drop the IDs below the direct children"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     #[cfg(not(target_family = "wasm"))]
     fn unwatching_a_nested_root_keeps_the_ids_of_an_outer_root()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2078,6 +2146,38 @@ mod tests {
         assert!(
             !deep_cached,
             "the root stops covering the entries below an unwatched directory"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn rewatching_a_nested_root_keeps_the_ids_of_an_outer_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut debouncer = tracking_debouncer(FileIdMap::new())?;
+
+        let tmpdir = tempdir()?;
+        let inner = tmpdir.path().join("inner");
+        let deep = inner.join("sub").join("deep.txt");
+        fs::create_dir_all(deep.parent().unwrap())?;
+        fs::write(&deep, b"content")?;
+
+        debouncer.watch(tmpdir.path(), RecursiveMode::Recursive)?;
+        debouncer.watch(&inner, RecursiveMode::Recursive)?;
+        debouncer.watch(&inner, RecursiveMode::NonRecursive)?;
+        let after_rewatch = debouncer
+            .data
+            .inner
+            .lock()
+            .unwrap()
+            .cache
+            .cached_file_id(&deep)
+            .is_some();
+
+        assert!(
+            after_rewatch,
+            "the outer recursive root still covers `inner` after the rewatch"
         );
 
         Ok(())

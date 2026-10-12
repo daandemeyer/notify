@@ -286,11 +286,17 @@ impl schema::State {
 pub struct TestCache {
     pub paths: HashMap<PathBuf, FileId>,
     pub file_system: HashMap<PathBuf, FileId>,
+    /// Number of `add_path` calls, so tests can assert that re-fingerprints are skipped.
+    pub add_path_calls: usize,
 }
 
 impl TestCache {
     pub fn new(paths: HashMap<PathBuf, FileId>, file_system: HashMap<PathBuf, FileId>) -> Self {
-        Self { paths, file_system }
+        Self {
+            paths,
+            file_system,
+            add_path_calls: 0,
+        }
     }
 }
 
@@ -300,6 +306,7 @@ impl FileIdCache for TestCache {
     }
 
     fn add_path(&mut self, path: &Path, recursive_mode: RecursiveMode) {
+        self.add_path_calls += 1;
         for (file_path, file_id) in &self.file_system {
             if file_path == path
                 || (file_path.starts_with(path) && recursive_mode == RecursiveMode::Recursive)
