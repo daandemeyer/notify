@@ -101,7 +101,7 @@ pub use notify_types::debouncer_full::DebouncedEvent;
 use file_id::FileId;
 use notify::{
     Error, ErrorKind, Event, EventKind, PathOp, RecommendedWatcher, RecursiveMode,
-    UpdatePathsError, Watcher, WatcherKind,
+    UpdatePathsError, WatchPathConfig, Watcher, WatcherKind,
     event::{ModifyKind, RemoveKind, RenameMode},
 };
 
@@ -285,7 +285,7 @@ impl<T: FileIdCache> DebounceDataInner<T> {
             .cloned()
             .collect();
         for root in nested_roots {
-            self.cache.add_path(&root.path, root.recursive_mode);
+            self.cache.add_path(&root.path, &[&root]);
         }
     }
 
@@ -439,27 +439,12 @@ impl<T: FileIdCache> DebounceDataInner<T> {
     /// Adds the path of an event to the cache. A non-recursive root covers itself and its direct
     /// children, but not the entries below a child, so a child is added without them.
     fn add_event_path(&mut self, path: &Path) {
-        match self.recursive_mode(path) {
-            RecursiveMode::NonRecursive if root_at(&self.roots, path).is_none() => {
-                self.cache.add_single_path(path)
-            }
-            recursive_mode => self.cache.add_path(path, recursive_mode),
+        let roots = covering_roots(&self.roots, path);
+        if roots.is_empty() {
+            self.cache.add_single_path(path);
+        } else {
+            self.cache.add_path(path, &roots);
         }
-    }
-
-    fn recursive_mode(&self, path: &Path) -> RecursiveMode {
-        for ancestor in path.ancestors() {
-            if let Ok(index) = self
-                .roots
-                .binary_search_by(|root| root.path.as_path().cmp(ancestor))
-            {
-                if self.roots[index].recursive_mode == RecursiveMode::Recursive {
-                    return RecursiveMode::Recursive;
-                }
-            }
-        }
-
-        RecursiveMode::NonRecursive
     }
 
     fn handle_rename_from(&mut self, event: Event) {
@@ -715,38 +700,32 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
         self.data.changed.notify_all();
     }
 
-    fn add_root(&mut self, path: impl Into<PathBuf>, recursive_mode: RecursiveMode) {
-        let path = path.into();
+    fn add_root(&mut self, path: impl Into<PathBuf>, config: WatchPathConfig) {
+        let root = WatchRoot::new(path, config);
 
         let mut data = self.data.inner.lock().unwrap();
 
         match data
             .roots
-            .binary_search_by(|root| root.path.as_path().cmp(path.as_path()))
+            .binary_search_by(|existing| existing.path.cmp(&root.path))
         {
             Ok(pos) => {
-                if data.roots[pos].recursive_mode == recursive_mode {
+                if data.roots[pos].config.recursive_mode() == root.config.recursive_mode() {
                     return;
                 }
                 // A rewatch without recursion leaves cached IDs below the direct children that
                 // no event updates any more.
-                data.roots[pos].recursive_mode = recursive_mode;
-                data.refresh_cache_under(&path);
+                data.roots[pos] = root.clone();
+                data.refresh_cache_under(&root.path);
                 return;
             }
             Err(pos) => {
                 // `VecDeque::insert` is O(min(pos, len - pos))
-                data.roots.insert(
-                    pos,
-                    WatchRoot {
-                        path: path.clone(),
-                        recursive_mode,
-                    },
-                );
+                data.roots.insert(pos, root.clone());
             }
         }
 
-        data.cache.add_path(&path, recursive_mode);
+        data.cache.add_path(&root.path, &[&root]);
     }
 
     fn remove_root(&mut self, path: impl AsRef<Path>) {
@@ -761,7 +740,7 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
         recursive_mode: RecursiveMode,
     ) -> notify::Result<()> {
         self.watcher.watch(path.as_ref(), recursive_mode)?;
-        self.add_root(path.as_ref(), recursive_mode);
+        self.add_root(path.as_ref(), WatchPathConfig::new(recursive_mode));
         Ok(())
     }
 
@@ -823,7 +802,7 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
                 paths.push((
                     op.as_path().to_path_buf(),
                     match op {
-                        PathOp::Watch(_, config) => Some(config.recursive_mode()),
+                        PathOp::Watch(_, config) => Some(config.clone()),
                         PathOp::Unwatch(_) => None,
                     },
                 ));
@@ -841,7 +820,7 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
         let updated_paths = &paths[..updated_len];
         for (path, watch_mode) in updated_paths {
             match watch_mode {
-                Some(recursive_mode) => self.add_root(path, *recursive_mode),
+                Some(config) => self.add_root(path, config.clone()),
                 None => self.remove_root(path),
             }
         }
@@ -991,9 +970,20 @@ fn root_at<'a>(roots: &'a VecDeque<WatchRoot>, path: &Path) -> Option<&'a WatchR
 /// Returns whether the watch on `root` reports changes to `path`, which is `root.path` or below
 /// it. A non-recursive watch reports its root and the direct children of its root.
 fn reports(root: &WatchRoot, path: &Path) -> bool {
-    root.recursive_mode == RecursiveMode::Recursive
+    root.config.recursive_mode() == RecursiveMode::Recursive
         || root.path == path
         || path.parent() == Some(root.path.as_path())
+}
+
+/// Returns the roots whose watch covers the entries below `path`: the recursive roots at or above
+/// `path`, and a non-recursive root at `path`.
+fn covering_roots<'a>(roots: &'a VecDeque<WatchRoot>, path: &Path) -> Vec<&'a WatchRoot> {
+    path.ancestors()
+        .filter_map(|ancestor| root_at(roots, ancestor))
+        .filter(|root| {
+            root.path == path || root.config.recursive_mode() == RecursiveMode::Recursive
+        })
+        .collect()
 }
 
 fn sort_events(events: Vec<DebouncedEvent>) -> Vec<DebouncedEvent> {
@@ -1232,10 +1222,10 @@ mod tests {
         MockTime::set_time(time);
 
         let mut state = test_case.state.into_debounce_data_inner(time);
-        state.roots = VecDeque::from([WatchRoot {
-            path: PathBuf::from("/"),
-            recursive_mode: RecursiveMode::Recursive,
-        }]);
+        state.roots = VecDeque::from([WatchRoot::new(
+            "/",
+            WatchPathConfig::new(RecursiveMode::Recursive),
+        )]);
 
         let mut prev_event_time = Duration::default();
 
@@ -1320,14 +1310,8 @@ mod tests {
     fn a_rename_reported_for_two_roots_pairs_the_paths_of_each_root() {
         let mut state = DebounceDataInner::new(NoCache, Duration::from_millis(50));
         state.roots = VecDeque::from([
-            WatchRoot {
-                path: PathBuf::from("/alias"),
-                recursive_mode: RecursiveMode::Recursive,
-            },
-            WatchRoot {
-                path: PathBuf::from("/real"),
-                recursive_mode: RecursiveMode::Recursive,
-            },
+            WatchRoot::new("/alias", WatchPathConfig::new(RecursiveMode::Recursive)),
+            WatchRoot::new("/real", WatchPathConfig::new(RecursiveMode::Recursive)),
         ]);
         // `/alias` is a symlink to `/real`, and the backend reports the rename for each root.
         let rename = |mode, path: &str| {
@@ -1357,14 +1341,8 @@ mod tests {
         MockTime::set_time(Instant::now());
         let mut state = DebounceDataInner::new(NoCache, Duration::from_millis(50));
         state.roots = VecDeque::from([
-            WatchRoot {
-                path: PathBuf::from("/a"),
-                recursive_mode: RecursiveMode::Recursive,
-            },
-            WatchRoot {
-                path: PathBuf::from("/b"),
-                recursive_mode: RecursiveMode::Recursive,
-            },
+            WatchRoot::new("/a", WatchPathConfig::new(RecursiveMode::Recursive)),
+            WatchRoot::new("/b", WatchPathConfig::new(RecursiveMode::Recursive)),
         ]);
         let rename = |mode, path: &str| {
             Event::new(EventKind::Modify(ModifyKind::Name(mode)))
@@ -1399,10 +1377,7 @@ mod tests {
             let mut state = DebounceDataInner::new(NoCache, Duration::from_millis(50));
             state.roots = roots
                 .into_iter()
-                .map(|path| WatchRoot {
-                    path: PathBuf::from(path),
-                    recursive_mode: RecursiveMode::Recursive,
-                })
+                .map(|path| WatchRoot::new(path, WatchPathConfig::new(RecursiveMode::Recursive)))
                 .collect();
             state.add_event(Event::new(initial_kind).add_path(PathBuf::from(initial_path)));
             state
@@ -1433,10 +1408,7 @@ mod tests {
         MockTime::set_time(time);
         let mut state = DebounceDataInner::new(NoCache, Duration::from_millis(50));
         state.roots = ["/a", "/b"]
-            .map(|path| WatchRoot {
-                path: PathBuf::from(path),
-                recursive_mode: RecursiveMode::Recursive,
-            })
+            .map(|path| WatchRoot::new(path, WatchPathConfig::new(RecursiveMode::Recursive)))
             .into();
         let rename = |mode, path: &str, tracker| {
             Event::new(EventKind::Modify(ModifyKind::Name(mode)))
@@ -1467,14 +1439,8 @@ mod tests {
     fn a_new_tracker_finishes_a_pending_rename_between_roots() {
         let mut state = DebounceDataInner::new(NoCache, Duration::from_millis(50));
         state.roots = VecDeque::from([
-            WatchRoot {
-                path: PathBuf::from("/a"),
-                recursive_mode: RecursiveMode::Recursive,
-            },
-            WatchRoot {
-                path: PathBuf::from("/b"),
-                recursive_mode: RecursiveMode::Recursive,
-            },
+            WatchRoot::new("/a", WatchPathConfig::new(RecursiveMode::Recursive)),
+            WatchRoot::new("/b", WatchPathConfig::new(RecursiveMode::Recursive)),
         ]);
         let rename = |mode, path: &str, tracker| {
             Event::new(EventKind::Modify(ModifyKind::Name(mode)))
@@ -1499,14 +1465,8 @@ mod tests {
             MockTime::set_time(time);
             let mut state = DebounceDataInner::new(NoCache, Duration::from_millis(50));
             state.roots = VecDeque::from([
-                WatchRoot {
-                    path: PathBuf::from("/alias"),
-                    recursive_mode: RecursiveMode::Recursive,
-                },
-                WatchRoot {
-                    path: PathBuf::from("/real"),
-                    recursive_mode: RecursiveMode::Recursive,
-                },
+                WatchRoot::new("/alias", WatchPathConfig::new(RecursiveMode::Recursive)),
+                WatchRoot::new("/real", WatchPathConfig::new(RecursiveMode::Recursive)),
             ]);
             let rename = |mode, path: &str| {
                 Event::new(EventKind::Modify(ModifyKind::Name(mode)))
@@ -1544,34 +1504,50 @@ mod tests {
     }
 
     #[test]
-    fn recursive_mode_uses_recursive_root_for_overlapping_watches() {
-        let state = DebounceDataInner {
-            queues: HashMap::default(),
-            roots: VecDeque::from([
-                WatchRoot {
-                    path: PathBuf::from("root"),
-                    recursive_mode: RecursiveMode::NonRecursive,
-                },
-                WatchRoot {
-                    path: PathBuf::from("root/nested"),
-                    recursive_mode: RecursiveMode::Recursive,
-                },
-            ]),
-            cache: NoCache,
-            rename_events: Vec::new(),
-            pending_rename_destinations: Vec::new(),
-            rescan_event: None,
-            errors: Vec::new(),
-            timeout: Duration::from_millis(50),
-        };
-
-        assert_eq!(
-            state.recursive_mode(Path::new("root/nested/child")),
-            RecursiveMode::Recursive
+    fn an_event_path_is_added_with_the_roots_that_cover_it() {
+        let file_system = [
+            "root/nested/child",
+            "root/nested/child/deep",
+            "root/other",
+            "root/other/deep",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(id, path)| (PathBuf::from(path), FileId::new_inode(id as u64, id as u64)))
+        .collect();
+        let mut state = DebounceDataInner::new(
+            testing::TestCache::new(Default::default(), file_system),
+            Duration::from_millis(50),
         );
-        assert_eq!(
-            state.recursive_mode(Path::new("root/other")),
-            RecursiveMode::NonRecursive
+        state.roots = VecDeque::from([
+            WatchRoot::new("root", WatchPathConfig::new(RecursiveMode::NonRecursive)),
+            WatchRoot::new(
+                "root/nested",
+                WatchPathConfig::new(RecursiveMode::Recursive),
+            ),
+        ]);
+
+        // The recursive root covers the entries below `child`.
+        state.add_event_path(Path::new("root/nested/child"));
+        assert!(
+            state
+                .cache
+                .cached_file_id(Path::new("root/nested/child/deep"))
+                .is_some()
+        );
+        // The non-recursive root covers `other`, but not the entries below it.
+        state.add_event_path(Path::new("root/other"));
+        assert!(
+            state
+                .cache
+                .cached_file_id(Path::new("root/other"))
+                .is_some()
+        );
+        assert!(
+            state
+                .cache
+                .cached_file_id(Path::new("root/other/deep"))
+                .is_none()
         );
     }
 
@@ -1937,7 +1913,7 @@ mod tests {
             .unwrap()
             .roots
             .iter()
-            .map(|root| (root.path.clone(), root.recursive_mode))
+            .map(|root| (root.path.clone(), root.config.recursive_mode()))
             .collect();
         assert_eq!(
             roots,
@@ -2048,7 +2024,10 @@ mod tests {
         debouncer.watch(&path, RecursiveMode::NonRecursive)?;
         let data = debouncer.data.inner.lock().unwrap();
         assert_eq!(data.cache.add_path_calls, 2);
-        assert_eq!(data.roots[0].recursive_mode, RecursiveMode::NonRecursive);
+        assert_eq!(
+            data.roots[0].config.recursive_mode(),
+            RecursiveMode::NonRecursive
+        );
 
         Ok(())
     }

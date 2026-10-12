@@ -39,7 +39,8 @@ impl FileIdCache for FileIdMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notify::RecursiveMode;
+    use crate::WatchRoot;
+    use notify::{RecursiveMode, WatchPathConfig};
     use std::fs;
 
     #[test]
@@ -50,14 +51,17 @@ mod tests {
         let grandchild = child.join("grandchild");
         fs::create_dir_all(&grandchild).unwrap();
 
+        let watch_root =
+            |recursive_mode| WatchRoot::new(root, WatchPathConfig::new(recursive_mode));
+
         let mut cache = FileIdMap::new();
-        cache.add_path(root, RecursiveMode::NonRecursive);
+        cache.add_path(root, &[&watch_root(RecursiveMode::NonRecursive)]);
         assert!(cache.cached_file_id(root).is_some());
         assert!(cache.cached_file_id(&child).is_some());
         assert!(cache.cached_file_id(&grandchild).is_none());
 
         let mut cache = FileIdMap::new();
-        cache.add_path(root, RecursiveMode::Recursive);
+        cache.add_path(root, &[&watch_root(RecursiveMode::Recursive)]);
         assert!(cache.cached_file_id(&grandchild).is_some());
     }
 }

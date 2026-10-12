@@ -12,6 +12,7 @@
 - FIX: if the watcher fails to construct, `new_debouncer_opt` no longer leaks the debouncer thread or the event handler [#1040]
 - PERF: park the debouncer thread to avoid idle polling [#933]
 - CHANGE: `FileIdCache::rescan` takes `&[WatchRoot]` instead of `&[(PathBuf, RecursiveMode)]`; `WatchRoot` is `#[non_exhaustive]`, provides `WatchRoot::new`, and requires `..` when destructuring **breaking**
+- CHANGE: `FileIdCache::add_path` takes the `WatchRoot`s that cover the path instead of a `RecursiveMode`, and `WatchRoot` stores the `WatchPathConfig` of a root instead of its `RecursiveMode`, so a new option of a root does not change the trait again; `WatchRoot::new` takes the `WatchPathConfig` **breaking**
 
 [#933]: https://github.com/notify-rs/notify/pull/933
 

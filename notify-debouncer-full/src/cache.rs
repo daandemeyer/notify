@@ -1,5 +1,5 @@
 use file_id::FileId;
-use notify::RecursiveMode;
+use notify::{RecursiveMode, WatchPathConfig};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -9,26 +9,26 @@ use walkdir::WalkDir;
 pub struct WatchRoot {
     /// The watched path.
     pub path: PathBuf,
-    /// Whether the watch covers the path's descendants.
-    pub recursive_mode: RecursiveMode,
+    /// The options the path was watched with.
+    pub config: WatchPathConfig,
 }
 
 impl WatchRoot {
-    /// Creates a watch root with the given path and recursive mode.
+    /// Creates the root of a watch on `path` with the options `config`.
     ///
     /// # Examples
     ///
     /// ```
-    /// use notify::RecursiveMode;
+    /// use notify::{RecursiveMode, WatchPathConfig};
     /// use notify_debouncer_full::WatchRoot;
     ///
-    /// let root = WatchRoot::new("src".into(), RecursiveMode::Recursive);
+    /// let root = WatchRoot::new("src", WatchPathConfig::new(RecursiveMode::Recursive));
     /// ```
     #[must_use]
-    pub fn new(path: PathBuf, recursive_mode: RecursiveMode) -> Self {
+    pub fn new(path: impl Into<PathBuf>, config: WatchPathConfig) -> Self {
         Self {
-            path,
-            recursive_mode,
+            path: path.into(),
+            config,
         }
     }
 }
@@ -46,13 +46,14 @@ pub trait FileIdCache {
     ///
     /// This will be called if a new file or directory is created or if an existing file is overridden.
     ///
-    /// The default implementation walks `path` and calls `add_single_path` for each entry. With
-    /// [`RecursiveMode::NonRecursive`], the walk stops at the direct children of `path`.
-    fn add_path(&mut self, path: &Path, recursive_mode: RecursiveMode) {
-        let max_depth = match recursive_mode {
-            RecursiveMode::Recursive => usize::MAX,
-            RecursiveMode::NonRecursive => 1,
-        };
+    /// `roots` are the watches that cover `path`: a watch on `path` itself and the recursive
+    /// watches above it. The default implementation walks `path` and calls `add_single_path` for
+    /// each entry. When no root is recursive, the walk stops at the direct children of `path`.
+    fn add_path(&mut self, path: &Path, roots: &[&WatchRoot]) {
+        let is_recursive = roots
+            .iter()
+            .any(|root| root.config.recursive_mode() == RecursiveMode::Recursive);
+        let max_depth = if is_recursive { usize::MAX } else { 1 };
         for entry in WalkDir::new(path)
             .follow_links(true)
             .max_depth(max_depth)
@@ -83,7 +84,7 @@ pub trait FileIdCache {
     /// The default implementation calls `add_path` for each root.
     fn rescan(&mut self, roots: &[WatchRoot]) {
         for root in roots {
-            self.add_path(&root.path, root.recursive_mode);
+            self.add_path(&root.path, &[root]);
         }
     }
 }
@@ -107,7 +108,7 @@ impl FileIdCache for NoCache {
         Option::<&FileId>::None
     }
 
-    fn add_path(&mut self, _path: &Path, _recursive_mode: RecursiveMode) {}
+    fn add_path(&mut self, _path: &Path, _roots: &[&WatchRoot]) {}
 
     fn add_single_path(&mut self, _path: &Path) {}
 

@@ -305,12 +305,13 @@ impl FileIdCache for TestCache {
         self.paths.get(path)
     }
 
-    fn add_path(&mut self, path: &Path, recursive_mode: RecursiveMode) {
+    fn add_path(&mut self, path: &Path, roots: &[&crate::WatchRoot]) {
         self.add_path_calls += 1;
+        let is_recursive = roots
+            .iter()
+            .any(|root| root.config.recursive_mode() == RecursiveMode::Recursive);
         for (file_path, file_id) in &self.file_system {
-            if file_path == path
-                || (file_path.starts_with(path) && recursive_mode == RecursiveMode::Recursive)
-            {
+            if file_path == path || (file_path.starts_with(path) && is_recursive) {
                 self.paths.insert(file_path.clone(), *file_id);
             }
         }
