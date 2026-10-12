@@ -598,13 +598,15 @@ impl EventLoop {
             return Ok(());
         }
 
-        let mut watch = self
-            .watches
-            .get(&path.absolute)
-            .cloned()
-            .unwrap_or_default();
+        // `watches` compares paths by component, so `dir/` finds the entry of `dir`. The kqueue
+        // crate compares the spelling of the path, so a new spelling would open a second watch
+        // on the same file. The entry keeps the spelling that it was added with.
+        let (key, mut watch) = match self.watches.get_key_value(&path.absolute) {
+            Some((key, watch)) => (key.clone(), watch.clone()),
+            None => (path.absolute.clone(), Watch::default()),
+        };
         for root in roots {
-            watch.add_root(&path.absolute, root, &self.user_roots);
+            watch.add_root(&key, root, &self.user_roots);
         }
 
         let event_filter = EventFilter::EVFILT_VNODE;
@@ -616,12 +618,12 @@ impl EventLoop {
             | FilterFlag::NOTE_RENAME
             | FilterFlag::NOTE_REVOKE;
 
-        log::trace!("adding kqueue watch: {}", path.absolute.display());
+        log::trace!("adding kqueue watch: {}", key.display());
 
         self.kqueue
-            .add_filename(&path.absolute, event_filter, filter_flags)
+            .add_filename(&key, event_filter, filter_flags)
             .map_err(|e| map_kqueue_io_error(e).add_path(path.requested.clone()))?;
-        self.watches.insert(path.absolute, watch);
+        self.watches.insert(key, watch);
 
         Ok(())
     }
@@ -1830,6 +1832,33 @@ mod tests {
 
         assert!(event_loop.watches.contains_key(&link));
         assert!(!event_loop.watches.contains_key(&link.join("sub")));
+        Ok(())
+    }
+
+    #[test]
+    fn a_path_with_a_trailing_separator_shares_the_watch_of_the_path()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub)?;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let kqueue = kqueue::Watcher::new()?;
+        let mut event_loop = EventLoop::new(kqueue, Box::new(tx), false, EventKindMask::ALL)?;
+        event_loop.add_watch(WatchPath::new(dir.path())?, true)?;
+        event_loop.add_watch(WatchPath::new(&dir.path().join("sub/"))?, false)?;
+
+        std::fs::write(sub.join("file"), b"content")?;
+        std::thread::sleep(Duration::from_millis(100));
+        event_loop.handle_kqueue();
+
+        // A second watch on `sub` would report the new file twice.
+        let created = rx
+            .try_iter()
+            .filter_map(Result::ok)
+            .filter(|event| event.kind.is_create())
+            .count();
+        assert_eq!(created, 1);
         Ok(())
     }
 
