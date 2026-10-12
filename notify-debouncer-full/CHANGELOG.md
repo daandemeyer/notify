@@ -14,6 +14,7 @@
 - PERF: park the debouncer thread to avoid idle polling [#933]
 - CHANGE: `FileIdCache::rescan` takes `&[WatchRoot]` instead of `&[(PathBuf, RecursiveMode)]`; `WatchRoot` is `#[non_exhaustive]`, provides `WatchRoot::new`, and requires `..` when destructuring **breaking**
 - CHANGE: `FileIdCache::add_path` takes the `WatchRoot`s that cover the path instead of a `RecursiveMode`, and `WatchRoot` stores the `WatchPathConfig` of a root instead of its `RecursiveMode`, so a new option of a root does not change the trait again; `WatchRoot::new` takes the `WatchPathConfig` **breaking**
+- FIX: the provided `FileIdCache::add_path` follows the symbolic links below a watch only when the watcher follows them. inotify, kqueue and `PollWatcher` follow them with `Config::with_follow_symlinks`, and FSEvents and Windows never follow them. On inotify, it follows the link of a non-recursive watch only when the watch dereferences the link. `WatchRoot::follow_symlinks` and `WatchRoot::dereference_symlinks` pass the settings to a custom cache
 
 [#933]: https://github.com/notify-rs/notify/pull/933
 

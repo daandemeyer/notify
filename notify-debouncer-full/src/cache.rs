@@ -11,10 +11,22 @@ pub struct WatchRoot {
     pub path: PathBuf,
     /// The options the path was watched with.
     pub config: WatchPathConfig,
+    /// Whether the watcher watches the target of a symbolic link at the path. Only a
+    /// non-recursive inotify watch that does not dereference the link watches the link itself,
+    /// and only when the path does not end with a separator. A trailing separator makes the path
+    /// name the target of the link.
+    pub dereference_symlinks: bool,
+    /// Whether the watcher watches the targets of the symbolic links below the path. inotify,
+    /// kqueue and the poll watcher follow
+    /// [`Config::with_follow_symlinks`](notify::Config::with_follow_symlinks) for the links that
+    /// their walks find. FSEvents and ReadDirectoryChangesW never watch the target of such a
+    /// link.
+    pub follow_symlinks: bool,
 }
 
 impl WatchRoot {
-    /// Creates the root of a watch on `path` with the options `config`.
+    /// Creates the root of a watch on `path` with the options `config`, for a watcher that
+    /// watches the target of a symbolic link at `path` and the targets of the links below it.
     ///
     /// # Examples
     ///
@@ -29,6 +41,8 @@ impl WatchRoot {
         Self {
             path: path.into(),
             config,
+            dereference_symlinks: true,
+            follow_symlinks: true,
         }
     }
 }
@@ -55,7 +69,15 @@ pub trait FileIdCache {
     /// and that includes `path` when it is not the path of the root. The watch does not report
     /// changes below such a directory, so IDs cached there would never be removed. The ID of the
     /// rejected directory itself is cached, because its watched parent reports its events.
+    ///
+    /// A root on a symbolic link only enters the target of the link with `dereference_symlinks`.
+    /// A root above a symbolic link only enters the link with `follow_symlinks`.
     fn add_path(&mut self, path: &Path, roots: &[&WatchRoot]) {
+        // The filter only applies to directories, and only a directory has entries to cache.
+        if !path.is_dir() {
+            self.add_single_path(path);
+            return;
+        }
         let max_depth = |root: &WatchRoot| match root.config.recursive_mode() {
             RecursiveMode::Recursive => usize::MAX,
             RecursiveMode::NonRecursive => 1,
@@ -66,8 +88,31 @@ pub trait FileIdCache {
             .iter()
             .any(|root| !root.config.watch_filter().is_accept_all())
             .then(|| crate::absolute_path(path));
+        let entering_path: Vec<_> = (0..roots.len())
+            .filter(|&index| {
+                let root = roots[index];
+                if path == root.path {
+                    // `Path::is_symlink` follows a link that is spelled with a trailing separator,
+                    // as inotify does. The watcher checks the root of a watch against its filter
+                    // when the watch is added, so the filter is not called again.
+                    return root.dereference_symlinks || !path.is_symlink();
+                }
+                // A watch above a symbolic link only watches below the link with
+                // `follow_symlinks`.
+                let follows_links = root.follow_symlinks
+                    || !path
+                        .ancestors()
+                        .take_while(|ancestor| *ancestor != root.path)
+                        .any(crate::is_symlink);
+                follows_links
+                    && absolute
+                        .as_ref()
+                        .is_none_or(|absolute| root.config.watch_filter().allows_dir(absolute))
+            })
+            .collect();
         let mut walk = WalkDir::new(path)
-            .follow_links(true)
+            .follow_links(roots.iter().any(|root| root.follow_symlinks))
+            .follow_root_links(!entering_path.is_empty())
             .max_depth(roots.iter().map(|root| max_depth(root)).max().unwrap_or(0))
             .into_iter();
         // The indices in `roots` of the roots that enter the last directory at each depth.
@@ -77,32 +122,31 @@ pub trait FileIdCache {
             let depth = entry.depth();
             entering.truncate(depth);
             self.add_single_path(entry.path());
-            if !entry.file_type().is_dir() {
-                continue;
-            }
-            let reaching = entering
-                .last()
-                .cloned()
-                .unwrap_or_else(|| (0..roots.len()).collect());
-            let entered: Vec<_> = reaching
-                .into_iter()
-                .filter(|&index| {
-                    let root = roots[index];
-                    let watch_filter = root.config.watch_filter();
-                    // The watcher checks the root of a watch when it is added.
-                    depth < max_depth(root)
-                        && ((depth == 0 && path == root.path)
-                            || watch_filter.is_accept_all()
-                            || absolute.as_ref().is_some_and(|absolute| {
-                                match entry.path().strip_prefix(path) {
-                                    Ok(relative) if depth > 0 => {
+            let entered = if depth == 0 {
+                // walkdir reports a followed link at the start of the walk as a link when it does
+                // not follow the links below the start. The roots that enter the start are
+                // therefore chosen before the walk.
+                entering_path.clone()
+            } else if entry.file_type().is_dir() {
+                entering[depth - 1]
+                    .iter()
+                    .copied()
+                    .filter(|&index| {
+                        let root = roots[index];
+                        let watch_filter = root.config.watch_filter();
+                        depth < max_depth(root)
+                            && (root.follow_symlinks || !entry.path_is_symlink())
+                            && (watch_filter.is_accept_all()
+                                || absolute.as_ref().is_some_and(|absolute| {
+                                    entry.path().strip_prefix(path).is_ok_and(|relative| {
                                         watch_filter.allows_dir(&absolute.join(relative))
-                                    }
-                                    _ => watch_filter.allows_dir(absolute),
-                                }
-                            }))
-                })
-                .collect();
+                                    })
+                                }))
+                    })
+                    .collect()
+            } else {
+                continue;
+            };
             if entered.is_empty() {
                 walk.skip_current_dir();
             }

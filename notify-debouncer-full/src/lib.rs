@@ -678,6 +678,7 @@ pub struct Debouncer<T: Watcher, C: FileIdCache> {
     debouncer_thread: Option<std::thread::JoinHandle<()>>,
     data: DebounceData<C>,
     stop: Arc<AtomicBool>,
+    follow_symlinks: bool,
 }
 
 impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
@@ -708,7 +709,14 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
     }
 
     fn add_root(&mut self, path: impl Into<PathBuf>, config: WatchPathConfig) {
-        let root = WatchRoot::new(path, config);
+        let mut root = WatchRoot::new(path, config);
+        root.follow_symlinks = self.follow_symlinks;
+        // Only inotify watches a link itself. A recursive inotify watch resolves the link, because
+        // it walks the target.
+        if T::kind() == WatcherKind::Inotify {
+            root.dereference_symlinks = root.config.dereference_symlinks()
+                || root.config.recursive_mode() == RecursiveMode::Recursive;
+        }
 
         let mut data = self
             .data
@@ -721,14 +729,15 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
             .binary_search_by(|existing| existing.path.cmp(&root.path))
         {
             Ok(pos) => {
-                // A rewatch with the same mode and without filters leaves the watch of the
+                // A rewatch with the same options and without filters leaves the watch of the
                 // backend as it is. Fingerprinting the root again walks the whole tree while the
                 // data mutex is held, which blocks the handling of events. The backends rebuild
                 // every rewatch with a filter, because two filters cannot be compared, and the
                 // cache does the same.
-                let current = &data.roots[pos].config;
-                if current.recursive_mode() == root.config.recursive_mode()
-                    && current.watch_filter().is_accept_all()
+                let current = &data.roots[pos];
+                if current.config.recursive_mode() == root.config.recursive_mode()
+                    && current.dereference_symlinks == root.dereference_symlinks
+                    && current.config.watch_filter().is_accept_all()
                     && root.config.watch_filter().is_accept_all()
                 {
                     return;
@@ -988,6 +997,13 @@ pub fn new_debouncer_opt<F: DebounceEventHandler, T: Watcher, C: FileIdCache + S
         debouncer_thread: Some(thread),
         data,
         stop,
+        // FSEvents and ReadDirectoryChangesW do not report changes in the target of a link below
+        // a watch.
+        follow_symlinks: config.follow_symlinks()
+            && !matches!(
+                T::kind(),
+                WatcherKind::Fsevent | WatcherKind::ReadDirectoryChangesWatcher
+            ),
     };
 
     Ok(guard)
@@ -1020,11 +1036,13 @@ fn root_at<'a>(roots: &'a VecDeque<WatchRoot>, path: &Path) -> Option<&'a WatchR
 }
 
 /// Returns whether the watch on `root` reports changes to `path`, which is `root.path` or below
-/// it. A non-recursive watch reports its root and the direct children of its root.
+/// it. A non-recursive watch reports its root and the direct children of its root. A watch on a
+/// link that does not dereference the link reports nothing below the link.
 fn reports(root: &WatchRoot, path: &Path) -> bool {
     root.config.recursive_mode() == RecursiveMode::Recursive
         || root.path == path
-        || path.parent() == Some(root.path.as_path())
+        || (path.parent() == Some(root.path.as_path())
+            && (root.dereference_symlinks || !root.path.is_symlink()))
 }
 
 /// Returns the roots whose watch covers the entries below `path`: the recursive roots at or above
@@ -1059,10 +1077,28 @@ fn absolute_path(path: &Path) -> PathBuf {
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Returns whether `path` is a symbolic link. `lstat` follows a link when the path ends with a
+/// separator, so a trailing separator is removed before the check.
+fn is_symlink(path: &Path) -> bool {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => parent.join(name).is_symlink(),
+        _ => path.is_symlink(),
+    }
+}
+
 fn root_reaches(root: &WatchRoot, path: &Path) -> bool {
+    // A watch does not reach the entries below a symbolic link that it does not follow.
+    let follows_links = root.follow_symlinks
+        || path == root.path
+        || !path
+            .ancestors()
+            .skip(1)
+            .take_while(|ancestor| *ancestor != root.path)
+            .any(is_symlink);
     let watch_filter = root.config.watch_filter();
-    watch_filter.is_accept_all()
-        || watch_filter.reaches(&absolute_path(&root.path), &absolute_path(path))
+    follows_links
+        && (watch_filter.is_accept_all()
+            || watch_filter.reaches(&absolute_path(&root.path), &absolute_path(path)))
 }
 
 fn sort_events(events: Vec<DebouncedEvent>) -> Vec<DebouncedEvent> {
@@ -2093,6 +2129,172 @@ mod tests {
             vec![(path3, RecursiveMode::Recursive)]
         );
 
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backend_other_than_inotify_watches_the_target_of_a_link()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut debouncer = tracking_debouncer(FileIdMap::new())?;
+
+        let tmpdir = tempdir()?;
+        let target = tmpdir.path().join("target");
+        let child = target.join("child");
+        fs::create_dir_all(&child)?;
+        let link = tmpdir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        debouncer.watch_with(
+            &link,
+            WatchPathConfig::new(RecursiveMode::NonRecursive).with_dereference_symlinks(false),
+        )?;
+        let cached = debouncer
+            .data
+            .inner
+            .lock()
+            .unwrap()
+            .cache
+            .cached_file_id(&link.join("child"))
+            .is_some();
+        assert!(cached);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_recursive_rewatch_that_only_stops_dereferencing_keeps_the_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut debouncer = new_debouncer_opt::<_, notify::INotifyWatcher, testing::TestCache>(
+            Duration::from_millis(20),
+            Some(Duration::from_millis(5)),
+            |_| {},
+            testing::TestCache::new(Default::default(), Default::default()),
+            // The watch reports no access events, so only the debouncer calls the cache.
+            notify::Config::default().with_event_kinds(notify::EventKindMask::CORE),
+        )?;
+
+        // inotify always dereferences the root of a recursive watch, so it keeps the watch.
+        let tmpdir = tempdir()?;
+        debouncer.watch(tmpdir.path(), RecursiveMode::Recursive)?;
+        debouncer.watch_with(
+            tmpdir.path(),
+            WatchPathConfig::new(RecursiveMode::Recursive).with_dereference_symlinks(false),
+        )?;
+        assert_eq!(debouncer.data.inner.lock().unwrap().cache.add_path_calls, 1);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unwatching_a_root_below_an_unfollowed_link_does_not_cache_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut debouncer = new_debouncer_opt::<_, notify::INotifyWatcher, FileIdMap>(
+            Duration::from_millis(20),
+            Some(Duration::from_millis(5)),
+            |_| {},
+            FileIdMap::new(),
+            notify::Config::default().with_follow_symlinks(false),
+        )?;
+
+        let tmpdir = tempdir()?;
+        let root = tmpdir.path().join("root");
+        let target = tmpdir.path().join("target");
+        fs::create_dir(&root)?;
+        fs::create_dir_all(target.join("inner").join("sub"))?;
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link)?;
+        let inner = link.join("inner");
+
+        debouncer.watch(&root, RecursiveMode::Recursive)?;
+        debouncer.watch(&inner, RecursiveMode::Recursive)?;
+        debouncer.unwatch(&inner)?;
+        // The watch on `root` does not follow `link`, so it does not report `inner`.
+        let inner_cached = debouncer
+            .data
+            .inner
+            .lock()
+            .unwrap()
+            .cache
+            .cached_file_id(&inner)
+            .is_some();
+        assert!(!inner_cached);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unwatching_a_root_below_a_watched_link_does_not_cache_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut debouncer = new_debouncer_opt::<_, notify::INotifyWatcher, FileIdMap>(
+            Duration::from_millis(20),
+            Some(Duration::from_millis(5)),
+            |_| {},
+            FileIdMap::new(),
+            notify::Config::default(),
+        )?;
+
+        let tmpdir = tempdir()?;
+        let target = tmpdir.path().join("target");
+        let child = target.join("child");
+        fs::create_dir_all(&child)?;
+        let link = tmpdir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        // The watch on `link` watches the link itself, so it reports nothing below the link.
+        debouncer.watch_with(
+            &link,
+            WatchPathConfig::new(RecursiveMode::NonRecursive).with_dereference_symlinks(false),
+        )?;
+        debouncer.watch(link.join("child"), RecursiveMode::Recursive)?;
+        debouncer.unwatch(link.join("child"))?;
+        let cached = debouncer
+            .data
+            .inner
+            .lock()
+            .unwrap()
+            .cache
+            .cached_file_id(&link.join("child"))
+            .is_some();
+        assert!(!cached);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_rewatch_that_stops_dereferencing_a_link_refreshes_the_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut debouncer = new_debouncer_opt::<_, notify::INotifyWatcher, FileIdMap>(
+            Duration::from_millis(20),
+            Some(Duration::from_millis(5)),
+            |_| {},
+            FileIdMap::new(),
+            notify::Config::default(),
+        )?;
+
+        let tmpdir = tempdir()?;
+        let target = tmpdir.path().join("target");
+        fs::create_dir_all(target.join("child"))?;
+        let link = tmpdir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link)?;
+        let child_cached = |debouncer: &Debouncer<notify::INotifyWatcher, FileIdMap>| {
+            debouncer
+                .data
+                .inner
+                .lock()
+                .unwrap()
+                .cache
+                .cached_file_id(&link.join("child"))
+                .is_some()
+        };
+
+        debouncer.watch(&link, RecursiveMode::NonRecursive)?;
+        assert!(child_cached(&debouncer));
+        debouncer.watch_with(
+            &link,
+            WatchPathConfig::new(RecursiveMode::NonRecursive).with_dereference_symlinks(false),
+        )?;
+        assert!(!child_cached(&debouncer));
         Ok(())
     }
 
