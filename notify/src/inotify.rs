@@ -22,7 +22,7 @@ use inotify as inotify_sys;
 use inotify_sys::{EventMask, Inotify, WatchDescriptor, WatchMask};
 use notify_types::event::EventKindMask;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{Metadata, metadata, read_dir, symlink_metadata};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
@@ -281,6 +281,12 @@ fn event_targets(
         })
         .collect()
 }
+
+/// `Listings` maps each directory that the walks of a batch read to the names of the entries
+/// that the walks visit in it. A directory is identified by its device, its inode and its change
+/// time. A directory that is deleted during a batch can pass its inode number to a new
+/// directory, and the two directories have different change times.
+type Listings = HashMap<(u64, u64, i64, i64), Vec<OsString>>;
 
 /// Queue `path` for removal, if it is watched and `descriptor` still matches its watch.
 #[inline]
@@ -845,8 +851,11 @@ impl EventLoop {
         } else {
             self.recursive_walk_barriers()
         };
+        let mut listings = Listings::new();
         for (path, report_created) in add_watches {
-            if let Err(err) = self.add_discovered_dir(path, &barriers, report_created) {
+            if let Err(err) =
+                self.add_discovered_dir(path, &barriers, &mut listings, report_created)
+            {
                 match WalkFailure::of(&err.kind) {
                     WalkFailure::Skip => {}
                     WalkFailure::Report => self.event_handler.handle_event(Err(err)),
@@ -925,6 +934,7 @@ impl EventLoop {
                         self.follow_links,
                         &barriers,
                         walked_ancestors(&replaced_path, &self.watches),
+                        None,
                     );
                     self.add_watches_for_paths(
                         root, entries, true, true, false, /*report_created*/ false,
@@ -952,6 +962,7 @@ impl EventLoop {
             self.follow_links,
             &barriers,
             Vec::new(),
+            None,
         );
 
         self.add_watches_for_paths(
@@ -969,6 +980,7 @@ impl EventLoop {
         &mut self,
         path: WatchPath,
         barriers: &HashSet<PathBuf>,
+        listings: &mut Listings,
         report_created: bool,
     ) -> Result<()> {
         // The walk starts below the recursive watch that covers `path`. A link back to a directory
@@ -979,6 +991,7 @@ impl EventLoop {
             self.follow_links,
             barriers,
             walked_ancestors(&path.absolute, &self.watches),
+            Some(listings),
         );
         self.add_watches_for_paths(path, entries, true, true, false, report_created)
     }
@@ -1384,6 +1397,39 @@ impl EventLoop {
     }
 }
 
+/// Returns the names of the subdirectories of `path`, and with `follow_links` also the names
+/// of its symbolic links. The errors of the entries whose type cannot be read are added to
+/// `errors`.
+fn visited_entries(
+    path: &WatchPath,
+    root: &WatchPath,
+    follow_links: bool,
+    errors: &mut Vec<Error>,
+) -> Result<Vec<OsString>> {
+    let entries = read_dir(&path.absolute)
+        .map_err(|err| Error::io_watch(err).add_path(path.requested.clone()))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                errors.push(Error::io_watch(err).add_path(path.requested.clone()));
+                continue;
+            }
+        };
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() || (follow_links && kind.is_symlink()) => {
+                names.push(entry.file_name());
+            }
+            Ok(_) => {}
+            Err(err) => {
+                errors.push(Error::io_watch(err).add_path(root.child(entry.path()).requested));
+            }
+        }
+    }
+    Ok(names)
+}
+
 /// Yields the directories to watch below `from`, and the errors that hid part of the tree.
 ///
 /// Each directory is named the way `root` was asked for, and `barriers` are the paths the walk
@@ -1396,10 +1442,11 @@ fn walk_dirs(
     follow_links: bool,
     barriers: &HashSet<PathBuf>,
     above: Vec<PathBuf>,
+    mut listings: Option<&mut Listings>,
 ) -> impl Iterator<Item = Result<WatchPath>> {
     enum Step {
         Visit(WatchPath),
-        Read(WatchPath),
+        Read(WatchPath, (u64, u64, i64, i64)),
         Leave,
         Error(Error),
     }
@@ -1458,43 +1505,46 @@ fn walk_dirs(
                     ancestors.push(identity);
                     pending.push(Step::Leave);
                     // Yield the directory before reading its contents so its watch is installed first.
-                    pending.push(Step::Read(path.clone()));
+                    let key = (
+                        identity.0,
+                        identity.1,
+                        metadata.ctime(),
+                        metadata.ctime_nsec(),
+                    );
+                    pending.push(Step::Read(path.clone(), key));
                     return Some(Ok(path));
                 }
-                Step::Read(path) => {
-                    let entries = match read_dir(&path.absolute) {
-                        Ok(entries) => entries,
-                        Err(err) => {
-                            return Some(Err(Error::io_watch(err).add_path(path.requested)));
+                Step::Read(path, key) => {
+                    // Each read of a directory makes inotify report an open and a close of the
+                    // directory. A batch can walk a new directory once for each of its paths,
+                    // so `listings` keeps the names that the first walk reads.
+                    let cached = listings.as_deref().and_then(|listings| listings.get(&key));
+                    let mut read = None;
+                    let names = match cached {
+                        Some(names) => names,
+                        None => {
+                            let mut errors = Vec::new();
+                            let names =
+                                match visited_entries(&path, &root, follow_links, &mut errors) {
+                                    Ok(names) => names,
+                                    Err(err) => return Some(Err(err)),
+                                };
+                            pending.extend(errors.into_iter().map(Step::Error));
+                            read.insert(names)
                         }
                     };
                     let start = pending.len();
                     // Buffer paths, not directory handles, so deep trees do not exhaust descriptors.
-                    for entry in entries {
-                        let entry = match entry {
-                            Ok(entry) => entry,
-                            Err(err) => {
-                                pending.push(Step::Error(
-                                    Error::io_watch(err).add_path(path.requested.clone()),
-                                ));
-                                continue;
-                            }
-                        };
-                        let absolute = entry.path();
-                        if barriers.contains(&absolute) {
-                            continue;
-                        }
-                        match entry.file_type() {
-                            Ok(kind) if kind.is_dir() || (follow_links && kind.is_symlink()) => {
-                                pending.push(Step::Visit(root.child(absolute)));
-                            }
-                            Ok(_) => {}
-                            Err(err) => pending.push(Step::Error(
-                                Error::io_watch(err).add_path(root.child(absolute).requested),
-                            )),
+                    for name in names {
+                        let absolute = path.absolute.join(name);
+                        if !barriers.contains(&absolute) {
+                            pending.push(Step::Visit(root.child(absolute)));
                         }
                     }
                     pending[start..].reverse();
+                    if let (Some(listings), Some(names)) = (listings.as_deref_mut(), read) {
+                        listings.insert(key, names);
+                    }
                 }
                 Step::Leave => {
                     ancestors.pop();
@@ -1943,6 +1993,7 @@ mod tests {
             true,
             &barriers,
             Vec::new(),
+            None,
         );
         let mut watched = Vec::new();
         let mut failures = Vec::new();
@@ -2049,6 +2100,7 @@ mod tests {
             true,
             &barriers,
             Vec::new(),
+            None,
         );
         let mut watched = Vec::new();
         let mut failures = Vec::new();
@@ -2093,6 +2145,7 @@ mod tests {
                 follow_links,
                 &barriers,
                 Vec::new(),
+                None,
             );
             assert_eq!(entries.next().unwrap().unwrap().absolute, root);
             let first = entries.next().unwrap().unwrap().absolute;
@@ -2723,6 +2776,38 @@ mod tests {
         event_loop.handle_inotify();
 
         assert!(!event_loop.watches.contains_key(&path));
+    }
+
+    #[test]
+    fn a_new_directory_that_several_links_reach_is_read_once() {
+        use notify_types::event::AccessKind;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        for link in ["a", "b", "c"] {
+            std::os::unix::fs::symlink(&target, root.join(link)).unwrap();
+        }
+        let (mut event_loop, rx) = test_event_loop_with_events();
+        event_loop
+            .add_watch(
+                WatchPath::new(&root).unwrap(),
+                recursive_watch(),
+                true,
+                false,
+            )
+            .unwrap();
+        drain_events(&mut event_loop, &rx);
+
+        std::fs::create_dir(target.join("new")).unwrap();
+        let opens = drain_events(&mut event_loop, &rx)
+            .into_iter()
+            .filter(|event| matches!(event.kind, EventKind::Access(AccessKind::Open(_))))
+            .count();
+        // The walks of `new` for the four paths of `target` read `new` once. inotify reports the
+        // read as an open of `new` on the watch of `new` and on the watch of `target`.
+        assert_eq!(opens, 2);
     }
 
     #[test]
