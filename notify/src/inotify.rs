@@ -837,9 +837,16 @@ impl EventLoop {
             }
         }
 
+        // A new directory below a directory that thousands of symlinks reach is walked once for
+        // each path of that directory. The walks do not add user watches, so the barriers stay
+        // the same.
+        let barriers = if add_watches.is_empty() {
+            HashSet::new()
+        } else {
+            self.recursive_walk_barriers()
+        };
         for (path, report_created) in add_watches {
-            let config = WatchPathConfig::new(RecursiveMode::Recursive);
-            if let Err(err) = self.add_watch(path, config, false, report_created) {
+            if let Err(err) = self.add_discovered_dir(path, &barriers, report_created) {
                 match WalkFailure::of(&err.kind) {
                     WalkFailure::Skip => {}
                     WalkFailure::Report => self.event_handler.handle_event(Err(err)),
@@ -939,19 +946,12 @@ impl EventLoop {
         }
 
         let barriers = self.recursive_walk_barriers();
-        // The walk of a new directory starts below the recursive watch that covers it. A link
-        // back to a directory above it is a loop, as it is in a walk of the whole watch.
-        let above = if watch_self {
-            Vec::new()
-        } else {
-            walked_ancestors(&path.absolute, &self.watches)
-        };
         let entries = walk_dirs(
             path.absolute.clone(),
             path.clone(),
             self.follow_links,
             &barriers,
-            above,
+            Vec::new(),
         );
 
         self.add_watches_for_paths(
@@ -962,6 +962,25 @@ impl EventLoop {
             watch_self,
             report_created,
         )
+    }
+
+    /// Walks a directory that appeared below a recursive watch.
+    fn add_discovered_dir(
+        &mut self,
+        path: WatchPath,
+        barriers: &HashSet<PathBuf>,
+        report_created: bool,
+    ) -> Result<()> {
+        // The walk starts below the recursive watch that covers `path`. A link back to a directory
+        // above `path` is a loop, as it is in a walk of the whole watch.
+        let entries = walk_dirs(
+            path.absolute.clone(),
+            path.clone(),
+            self.follow_links,
+            barriers,
+            walked_ancestors(&path.absolute, &self.watches),
+        );
+        self.add_watches_for_paths(path, entries, true, true, false, report_created)
     }
 
     fn recursive_walk_barriers(&self) -> HashSet<PathBuf> {
@@ -2680,6 +2699,30 @@ mod tests {
 
         assert!(!event_loop.watches.contains_key(&root.join("link")));
         assert!(events.is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn a_new_directory_that_is_replaced_by_a_file_before_its_walk_is_not_watched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let mut event_loop = test_event_loop();
+        event_loop
+            .add_watch(
+                WatchPath::new(&root).unwrap(),
+                recursive_watch(),
+                true,
+                false,
+            )
+            .unwrap();
+
+        let path = root.join("dir");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        event_loop.handle_inotify();
+
+        assert!(!event_loop.watches.contains_key(&path));
     }
 
     #[test]
