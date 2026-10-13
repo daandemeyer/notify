@@ -526,15 +526,14 @@ impl EventLoop {
                             // A new directory, a removal or a move can change the watches below
                             // each path of a shared descriptor. Other events only concern the
                             // paths that report them.
-                            let every_path = event.mask.intersects(
-                                EventMask::MOVED_FROM
-                                    | EventMask::DELETE
-                                    | EventMask::DELETE_SELF
-                                    | EventMask::UNMOUNT,
-                            ) || (event.mask.contains(EventMask::ISDIR)
-                                && event
-                                    .mask
-                                    .intersects(EventMask::CREATE | EventMask::MOVED_TO));
+                            let every_path =
+                                event.mask.intersects(
+                                    EventMask::MOVED_FROM
+                                        | EventMask::DELETE
+                                        | EventMask::DELETE_SELF
+                                        | EventMask::MOVED_TO
+                                        | EventMask::UNMOUNT,
+                                ) || event.mask.contains(EventMask::ISDIR | EventMask::CREATE);
                             let targets = event_targets(
                                 &self.paths,
                                 &self.watches,
@@ -605,6 +604,16 @@ impl EventLoop {
                                         evs.push(event);
                                     }
                                 } else if event.mask.contains(EventMask::MOVED_TO) {
+                                    // A rename replaces the entry at its destination. When that
+                                    // entry is a symlink to a directory, its path would otherwise
+                                    // keep the watch of the old target.
+                                    queue_watch_removal(
+                                        path,
+                                        None,
+                                        &self.watches,
+                                        &mut remove_watches,
+                                        WatchRemoval::WithOsCall,
+                                    );
                                     if let Some(event_path) = event_path
                                         && requested.contains(EventMask::MOVED_TO)
                                     {
@@ -2642,6 +2651,35 @@ mod tests {
             .map(|event| event.paths)
             .collect();
         assert_eq!(renames, [vec![from.join("file"), to.join("file")]]);
+    }
+
+    #[test]
+    fn a_link_that_a_rename_replaces_loses_its_watch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("link")).unwrap();
+        let (mut event_loop, rx) = test_event_loop_with_events();
+        event_loop
+            .add_watch(
+                WatchPath::new(&root).unwrap(),
+                recursive_watch(),
+                true,
+                false,
+            )
+            .unwrap();
+        assert!(event_loop.watches.contains_key(&root.join("link")));
+
+        std::fs::write(root.join("file"), b"").unwrap();
+        std::fs::rename(root.join("file"), root.join("link")).unwrap();
+        drain_events(&mut event_loop, &rx);
+        std::fs::write(target.join("file"), b"").unwrap();
+        let events = drain_events(&mut event_loop, &rx);
+
+        assert!(!event_loop.watches.contains_key(&root.join("link")));
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]
