@@ -282,6 +282,45 @@ fn event_targets(
         .collect()
 }
 
+/// Returns the entries in `watches` for each of the queued paths in `remove_watches`, when more
+/// than one path is queued.
+///
+/// A deleted directory that many symlinks reach queues each of its paths, and deleting a tree
+/// queues each of its directories. One scan of `watches` then finds the entries below every
+/// queued path, instead of one scan for each queued path. An entry is only added to the closest
+/// queued path at or above it. The removals of a batch run from the deepest path up, and each
+/// removes every entry at and below its path, so the removal of that path removes the entry.
+fn entries_below(
+    watches: &HashMap<PathBuf, Watch>,
+    remove_watches: &BTreeMap<PathBuf, WatchRemoval>,
+) -> HashMap<PathBuf, Vec<PathBuf>> {
+    let mut entries = HashMap::new();
+    if remove_watches.len() < 2 {
+        return entries;
+    }
+    let fewest_components = remove_watches
+        .keys()
+        .map(|path| path.components().count())
+        .min()
+        .unwrap_or(0);
+    for entry in watches.keys() {
+        // Each ancestor has one component less, so the ancestors with fewer components than
+        // every queued path are not looked up.
+        let ancestors = (entry.components().count() + 1).saturating_sub(fewest_components);
+        if let Some(closest) = entry
+            .ancestors()
+            .take(ancestors)
+            .find(|ancestor| remove_watches.contains_key(*ancestor))
+        {
+            entries
+                .entry(closest.to_path_buf())
+                .or_insert_with(Vec::new)
+                .push(entry.clone());
+        }
+    }
+    entries
+}
+
 /// `Listings` maps each directory that the walks of a batch read to the names of the entries
 /// that the walks visit in it. A directory is identified by its device, its inode and its change
 /// time. A directory that is deleted during a batch can pass its inode number to a new
@@ -304,6 +343,13 @@ fn queue_watch_removal(
         let pending = remove_watches.entry(path.to_owned()).or_insert(removal);
         *pending = (*pending).max(removal);
     }
+}
+
+/// The entries that removals took out of `watches`, and the descriptors to remove with them.
+#[derive(Default)]
+struct RemovedWatches {
+    paths: Vec<(WatchDescriptor, PathBuf)>,
+    descriptors: Vec<WatchDescriptor>,
 }
 
 /// Variant order is load-bearing: coalescing keeps the greater of two pending removals.
@@ -411,7 +457,7 @@ impl EventLoop {
                     let _ = tx.send(self.add_watch(path, config));
                 }
                 EventLoopMsg::RemoveWatch(path, tx) => {
-                    let _ = tx.send(self.remove_watch(path, false));
+                    let _ = tx.send(self.remove_watch(path));
                 }
                 EventLoopMsg::UpdatePaths(ops, tx) => {
                     // Buffer events so a bounded handler cannot block the batch reply.
@@ -427,9 +473,7 @@ impl EventLoop {
                                 WatchPath::from_parts(absolute, requested.clone()),
                                 config.clone(),
                             ),
-                            PathOp::Unwatch(_) => {
-                                self.remove_watch(absolute, /*remove_recursive*/ false)
-                            }
+                            PathOp::Unwatch(_) => self.remove_watch(absolute),
                         });
                         if let Err(source) = operation {
                             result = Err(UpdatePathsError {
@@ -813,21 +857,20 @@ impl EventLoop {
         // An ancestor sorts before its descendants, so reverse order removes descendants first:
         // recursive ancestor cleanup then neither repeats syscalls for kernel-removed watches nor
         // drops the mapping for a live, moved-out descendant.
+        let mut entries = entries_below(&self.watches, &remove_watches);
+        let mut removed = RemovedWatches::default();
         for (path, removal) in remove_watches.into_iter().rev() {
-            if !self.watches.contains_key(&path) {
-                continue;
-            }
-
-            let result = match removal {
-                WatchRemoval::WithOsCall => self.remove_watch(path, true),
-                WatchRemoval::DescriptorAlreadyRemoved => {
-                    self.remove_watch_without_root_os_call(path, true)
-                }
-            };
-            if let Err(err) = result {
+            let candidates = entries.remove(&path);
+            let root_os_call = removal == WatchRemoval::WithOsCall;
+            if let Err(err) =
+                self.remove_entries(path, true, root_os_call, candidates, &mut removed)
+            {
                 log::warn!("Unable to remove the path from the watches: {err:?}");
             }
         }
+        // The removals of a batch release their paths and descriptors together, so the paths of
+        // a descriptor that thousands of symlinks share are scanned once.
+        self.release(removed);
 
         // A new directory below a directory that thousands of symlinks reach is walked once for
         // each path of that directory. The walks do not add user watches, so the barriers stay
@@ -877,14 +920,14 @@ impl EventLoop {
                 return Ok(());
             }
             // The entries that other user watches cover stay.
-            self.remove_watch(path.absolute.clone(), false)?;
+            self.remove_watch(path.absolute.clone())?;
         }
         if self.watches.get(&path.absolute).is_some_and(|watch| {
             !dereference && !path_is_dir && watch.is_dir && watch.metadata.is_recursive
         }) {
             // A recursive walk already followed this link. Remove its inherited subtree before
             // replacing the root with an explicit watch on the link itself.
-            self.remove_watch(path.absolute.clone(), false)?;
+            self.remove_watch(path.absolute.clone())?;
         }
 
         self.add_user_watch(path, requested_is_recursive, dereference)
@@ -1162,33 +1205,44 @@ impl EventLoop {
         }
     }
 
-    /// Removes the user watch on `path`, or the entries below a directory that is gone.
+    /// Removes the user watch on `path`.
     ///
-    /// Without `remove_recursive`, an `unwatch` of a user watch removes that watch from the
-    /// entries it covers, and the entries that another user watch covers stay. An `unwatch` of
-    /// a directory that only a walk added stops the user watches above it from covering it. With
-    /// `remove_recursive`, the directory was deleted or moved away, so every entry below it is
-    /// removed, including the user watches.
-    fn remove_watch(&mut self, path: PathBuf, remove_recursive: bool) -> Result<()> {
-        self.remove_entries(path, remove_recursive, true)
+    /// An `unwatch` of a user watch removes that watch from the entries it covers, and the
+    /// entries that another user watch covers stay. An `unwatch` of a directory that only a walk
+    /// added stops the user watches above it from covering it.
+    fn remove_watch(&mut self, path: PathBuf) -> Result<()> {
+        let mut removed = RemovedWatches::default();
+        let result = self.remove_entries(path, false, true, None, &mut removed);
+        self.release(removed);
+        result
     }
 
-    /// Like [`Self::remove_watch`], after the kernel has already removed the descriptor of
-    /// `path`. The descriptors below `path` are removed one by one, because their files can
-    /// still exist, for example after they were moved elsewhere.
-    fn remove_watch_without_root_os_call(
-        &mut self,
-        path: PathBuf,
-        remove_recursive: bool,
-    ) -> Result<()> {
-        self.remove_entries(path, remove_recursive, false)
+    /// Like [`Self::remove_watch`] for a directory that was deleted or moved away, after the
+    /// kernel has already removed the descriptor of `path`.
+    #[cfg(test)]
+    fn remove_watch_without_root_os_call(&mut self, path: PathBuf) -> Result<()> {
+        let mut removed = RemovedWatches::default();
+        let result = self.remove_entries(path, true, false, None, &mut removed);
+        self.release(removed);
+        result
     }
 
+    /// Takes the entries at and below `path` out of `watches`, and adds them to `removed`.
+    ///
+    /// With `remove_recursive`, the directory was deleted or moved away, so every entry below it
+    /// is removed, including the user watches. Without `root_os_call`, the kernel has already
+    /// removed the descriptor of `path`. The descriptors below `path` are still removed one by
+    /// one, because their files can still exist, for example after they were moved elsewhere.
+    ///
+    /// `candidates` contains the entries at and below `path` that no other removal of the same
+    /// batch takes out. Without it, the entries are looked up.
     fn remove_entries(
         &mut self,
         path: PathBuf,
         remove_recursive: bool,
         root_os_call: bool,
+        candidates: Option<Vec<PathBuf>>,
+        removed: &mut RemovedWatches,
     ) -> Result<()> {
         if !self.watches.contains_key(&path) {
             return Err(Error::watch_not_found().add_path(path));
@@ -1197,14 +1251,13 @@ impl EventLoop {
 
         let drops = remove_user_roots(&mut self.user_roots, &path, remove_recursive);
 
-        let candidates: Vec<_> = self
-            .watches
-            .keys()
-            .filter(|candidate| candidate.starts_with(&path))
-            .cloned()
-            .collect();
-        let mut removed_descriptors = Vec::new();
-        let mut forgotten = Vec::new();
+        let candidates = candidates.unwrap_or_else(|| {
+            self.watches
+                .keys()
+                .filter(|candidate| candidate.starts_with(&path))
+                .cloned()
+                .collect()
+        });
         for candidate in candidates {
             let mut watch = self
                 .watches
@@ -1214,9 +1267,9 @@ impl EventLoop {
             watch.metadata.roots.retain(|root| !drops(root));
             if watch.metadata.roots.is_empty() {
                 if root_os_call || candidate != path {
-                    removed_descriptors.push(watch.watch_descriptor.clone());
+                    removed.descriptors.push(watch.watch_descriptor.clone());
                 }
-                forgotten.push((watch.watch_descriptor, candidate));
+                removed.paths.push((watch.watch_descriptor, candidate));
                 continue;
             }
             if watch.metadata.roots.len() != before {
@@ -1225,10 +1278,14 @@ impl EventLoop {
             }
             self.watches.insert(candidate, watch);
         }
-
-        self.forget_paths(forgotten);
-        self.release_descriptors(removed_descriptors);
         Ok(())
+    }
+
+    /// Removes the paths in `removed` from the paths of their descriptors, and removes the
+    /// descriptors that no path uses any more.
+    fn release(&mut self, removed: RemovedWatches) {
+        self.forget_paths(removed.paths);
+        self.release_descriptors(removed.descriptors);
     }
 
     /// Removes the descriptors that no path in `watches` uses any more.
@@ -1943,7 +2000,7 @@ mod tests {
         // The inner watch must follow this link even though the outer watch covers its target.
         std::fs::rename(&staging, inner.join("moved")).unwrap();
         event_loop.handle_inotify();
-        event_loop.remove_watch(outer, false).unwrap();
+        event_loop.remove_watch(outer).unwrap();
         event_loop.handle_inotify();
         // Ignore uninteresting events.
         rx.try_iter().for_each(drop);
@@ -2180,7 +2237,7 @@ mod tests {
         event_loop
             .add_watch(WatchPath::new(&outer).unwrap(), recursive_watch())
             .unwrap();
-        event_loop.remove_watch(shared.clone(), false).unwrap();
+        event_loop.remove_watch(shared.clone()).unwrap();
 
         // Only the user watch of `shared` requested `IN_DELETE_SELF`. `outer/link` itself still
         // exists, so its deletion must not be reported.
@@ -2219,7 +2276,7 @@ mod tests {
         // The kernel removed the descriptor of `root`, but `other/link` still uses the
         // descriptor of `root/shared`.
         event_loop
-            .remove_watch_without_root_os_call(root.clone(), true)
+            .remove_watch_without_root_os_call(root.clone())
             .unwrap();
         std::fs::write(shared.join("file"), b"content").unwrap();
         for _ in 0..5 {
@@ -2865,9 +2922,7 @@ mod tests {
             Path::new("reported-child/grandchild")
         );
 
-        event_loop
-            .remove_watch(root.clone(), false)
-            .expect("unwatch root");
+        event_loop.remove_watch(root.clone()).expect("unwatch root");
 
         assert_eq!(
             reported(&event_loop, &grandchild),
@@ -2926,7 +2981,7 @@ mod tests {
             .add_watch(WatchPath::new(&root).unwrap(), recursive_watch())
             .expect("watch root recursively");
         event_loop
-            .remove_watch(child.clone(), false)
+            .remove_watch(child.clone())
             .expect("carve out child");
         event_loop
             .add_watch(WatchPath::new(&child).unwrap(), non_recursive_watch())
@@ -3232,10 +3287,10 @@ mod tests {
             .expect("add_watch");
 
         event_loop
-            .remove_watch_without_root_os_call(watched.clone(), true)
+            .remove_watch_without_root_os_call(watched.clone())
             .expect("remove_watch_without_root_os_call");
 
-        let result = event_loop.remove_watch(watched.clone(), false);
+        let result = event_loop.remove_watch(watched.clone());
         assert!(
             matches!(
                 result,
@@ -4573,7 +4628,7 @@ mod tests {
         event_loop
             .add_watch(WatchPath::new(&root).unwrap(), recursive_watch())
             .unwrap();
-        event_loop.remove_watch(child.clone(), false).unwrap();
+        event_loop.remove_watch(child.clone()).unwrap();
 
         let mut watched: Vec<_> = event_loop.watches.keys().cloned().collect();
         watched.sort();
