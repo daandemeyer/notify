@@ -117,6 +117,14 @@ struct Watch {
     metadata: WatchMetadata,
 }
 
+impl Watch {
+    /// Whether the walks of recursive user watches stop at the path of this watch. A user watch
+    /// on a link that does not dereference the link watches the link itself.
+    fn is_walk_barrier(&self) -> bool {
+        self.metadata.is_user_watch && !self.dereference && !self.is_dir
+    }
+}
+
 /// Watcher implementation based on inotify
 #[derive(Debug)]
 pub struct INotifyWatcher {
@@ -162,14 +170,7 @@ fn add_watch_by_event(
     if !event.mask.contains(EventMask::ISDIR) {
         return;
     }
-    let Some(parent) = path.parent().and_then(|parent| watches.get(parent)) else {
-        return;
-    };
-    let roots: Vec<_> = parent
-        .metadata
-        .recursive_roots(user_roots)
-        .cloned()
-        .collect();
+    let roots = parent_recursive_roots(path, watches, user_roots);
     if !roots.is_empty() {
         add_watches.push((
             path.to_owned(),
@@ -203,6 +204,24 @@ fn walked_ancestors(
         }
     }
     ancestors
+}
+
+/// Returns the recursive user watches that cover the parent of `path`.
+fn parent_recursive_roots(
+    path: &Path,
+    watches: &HashMap<PathBuf, Watch>,
+    user_roots: &UserRoots,
+) -> Vec<Arc<Path>> {
+    path.parent()
+        .and_then(|parent| watches.get(parent))
+        .map(|parent| {
+            parent
+                .metadata
+                .recursive_roots(user_roots)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A path that an inotify event concerns.
@@ -457,7 +476,7 @@ impl EventLoop {
                     let _ = tx.send(self.add_watch(path, config));
                 }
                 EventLoopMsg::RemoveWatch(path, tx) => {
-                    let _ = tx.send(self.remove_watch(path));
+                    let _ = tx.send(self.unwatch(path));
                 }
                 EventLoopMsg::UpdatePaths(ops, tx) => {
                     // Buffer events so a bounded handler cannot block the batch reply.
@@ -882,9 +901,17 @@ impl EventLoop {
         };
         let mut listings = Listings::new();
         for (path, roots, report_created) in add_watches {
-            if let Err(err) =
-                self.add_discovered_dir(path, &roots, &barriers, &mut listings, report_created)
-            {
+            // The walk starts below the recursive watches that cover `path`. A link back to a
+            // directory above `path` is a loop, as it is in a walk of a whole watch.
+            let above = walked_ancestors(&path, &self.watches, &self.user_roots);
+            if let Err(err) = self.add_discovered_dir(
+                path,
+                &roots,
+                &barriers,
+                above,
+                &mut listings,
+                report_created,
+            ) {
                 match WalkFailure::of(&err.kind) {
                     WalkFailure::Skip => {}
                     WalkFailure::Report => self.event_handler.handle_event(Err(err)),
@@ -909,6 +936,10 @@ impl EventLoop {
             .map_err(Error::io_watch)?
             .is_dir();
         let requested_is_recursive = is_recursive && path_is_dir;
+        let was_walk_barrier = self
+            .watches
+            .get(&path.absolute)
+            .is_some_and(Watch::is_walk_barrier);
 
         if let Some(root) = self.user_roots.get(path.absolute.as_path()) {
             if root.rewatch_is_noop(&path.requested, requested_is_recursive)
@@ -930,7 +961,15 @@ impl EventLoop {
             self.remove_watch(path.absolute.clone())?;
         }
 
-        self.add_user_watch(path, requested_is_recursive, dereference)
+        let root = path.absolute.clone();
+        let result = self.add_user_watch(path, requested_is_recursive, dereference);
+        if was_walk_barrier
+            && result.is_ok()
+            && !self.watches.get(&root).is_some_and(Watch::is_walk_barrier)
+        {
+            self.walk_link_again(root);
+        }
+        result
     }
 
     fn add_user_watch(
@@ -976,13 +1015,64 @@ impl EventLoop {
         result
     }
 
+    /// Removes the user watch on `path`.
+    fn unwatch(&mut self, path: PathBuf) -> Result<()> {
+        let was_walk_barrier = self.watches.get(&path).is_some_and(Watch::is_walk_barrier);
+        self.remove_watch(path.clone())?;
+        if was_walk_barrier {
+            self.walk_link_again(path);
+        }
+        Ok(())
+    }
+
+    /// Walks the link at `path` for the recursive user watches that cover its parent.
+    ///
+    /// The walks of the recursive user watches above a link stop at the link when a user watch
+    /// on the link does not dereference it. Adding such a user watch removes the entries that
+    /// the walks added through the link. After the user watch on the link is removed or
+    /// dereferences the link, each recursive user watch walks the link as a new walk of its
+    /// tree would.
+    fn walk_link_again(&mut self, path: PathBuf) {
+        if !self.follow_links {
+            return;
+        }
+        // `lstat` follows a link that is spelled with a trailing separator. The walk has to see the
+        // link itself, because it checks for a loop only at a link.
+        let path = crate::paths::without_trailing_separator(&path);
+        let barriers = self.recursive_walk_barriers();
+        let mut listings = Listings::new();
+        for root in parent_recursive_roots(&path, &self.watches, &self.user_roots) {
+            // The walk of `root` reports a link to a directory that it passed through as a loop.
+            let above = path
+                .ancestors()
+                .skip(1)
+                .take_while(|ancestor| ancestor.starts_with(&root))
+                .map(Path::to_path_buf)
+                .collect();
+            let roots = std::slice::from_ref(&root);
+            if let Err(err) = self.add_discovered_dir(
+                path.clone(),
+                roots,
+                &barriers,
+                above,
+                &mut listings,
+                /*report_created*/ false,
+            ) {
+                self.event_handler.handle_event(Err(err));
+            }
+        }
+    }
+
     /// Walks a directory that appeared below a directory that the recursive user watches
-    /// `roots` cover. One walk adds every root, so each directory is watched once.
+    /// `roots` cover. One walk adds every root, so each directory is watched once. `above`
+    /// contains the directories above `path` that the walks of `roots` passed through. The walk
+    /// reports a link to a directory in `above` as a loop.
     fn add_discovered_dir(
         &mut self,
         path: PathBuf,
         roots: &[Arc<Path>],
         barriers: &HashSet<PathBuf>,
+        above: Vec<PathBuf>,
         listings: &mut Listings,
         report_created: bool,
     ) -> Result<()> {
@@ -999,9 +1089,6 @@ impl EventLoop {
             first.to_path_buf(),
             self.user_roots[first].requested.clone(),
         );
-        // The walk starts below the recursive watches that cover `path`. A link back to a
-        // directory above `path` is a loop, as it is in a walk of a whole watch.
-        let above = walked_ancestors(&path, &self.watches, &self.user_roots);
         let entries = walk_dirs(
             path,
             root_path,
@@ -1016,9 +1103,7 @@ impl EventLoop {
     fn recursive_walk_barriers(&self) -> HashSet<PathBuf> {
         self.watches
             .iter()
-            .filter(|(_, watch)| {
-                watch.metadata.is_user_watch && !watch.dereference && !watch.is_dir
-            })
+            .filter(|(_, watch)| watch.is_walk_barrier())
             .map(|(path, _)| path.clone())
             .collect()
     }
@@ -4430,6 +4515,203 @@ mod tests {
             !event_loop.watches.contains_key(&link.join("nested")),
             "the recursive walk crossed an explicit non-dereferenced link"
         );
+    }
+
+    #[test]
+    fn unwatching_a_non_dereferenced_link_lets_the_recursive_watch_walk_it_again() {
+        for link_first in [false, true] {
+            let tmpdir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let root = tmpdir.path().to_path_buf();
+            let destination = outside.path().join("destination");
+            let nested = destination.join("nested");
+            let link = root.join("link");
+            std::fs::create_dir_all(&nested).unwrap();
+            std::os::unix::fs::symlink(&destination, &link).unwrap();
+
+            let (mut event_loop, rx) = test_event_loop_with_events();
+            let link_watch = non_recursive_watch().with_dereference_symlinks(false);
+            if link_first {
+                event_loop
+                    .add_watch(WatchPath::new(&link).unwrap(), link_watch.clone())
+                    .unwrap();
+            }
+            event_loop
+                .add_watch(WatchPath::new(&root).unwrap(), recursive_watch())
+                .unwrap();
+            if !link_first {
+                event_loop
+                    .add_watch(WatchPath::new(&link).unwrap(), link_watch.clone())
+                    .unwrap();
+            }
+            event_loop.unwatch(link.clone()).unwrap();
+
+            std::fs::write(nested.join("file"), b"content").unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            event_loop.handle_inotify();
+            let paths: Vec<_> = rx
+                .try_iter()
+                .filter_map(Result::ok)
+                .flat_map(|event| event.paths)
+                .collect();
+            assert!(
+                paths.contains(&link.join("nested").join("file")),
+                "link_first: {link_first}, {paths:?}"
+            );
+        }
+    }
+
+    /// Returns a directory `root` with a link `root/link` to a directory outside of it, and the
+    /// directory `nested` in the target of the link.
+    fn root_with_a_link_to_outside() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().join("root");
+        let destination = tmpdir.path().join("destination");
+        let nested = destination.join("nested");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&destination, &link).unwrap();
+        (tmpdir, root, link, nested)
+    }
+
+    #[test]
+    fn dereferencing_a_link_on_rewatch_lets_the_recursive_watch_walk_it_again() {
+        let (_tmpdir, root, link, _nested) = root_with_a_link_to_outside();
+        let mut event_loop = test_event_loop();
+        event_loop
+            .add_watch(WatchPath::new(&root).unwrap(), recursive_watch())
+            .unwrap();
+        event_loop
+            .add_watch(
+                WatchPath::new(&link).unwrap(),
+                non_recursive_watch().with_dereference_symlinks(false),
+            )
+            .unwrap();
+        assert!(!event_loop.watches.contains_key(&link.join("nested")));
+        event_loop
+            .add_watch(WatchPath::new(&link).unwrap(), non_recursive_watch())
+            .unwrap();
+        assert!(event_loop.watches.contains_key(&link.join("nested")));
+    }
+
+    #[test]
+    fn unwatching_a_link_watch_does_not_walk_the_link_without_follow_symlinks() {
+        let (_tmpdir, root, link, _nested) = root_with_a_link_to_outside();
+        let mut event_loop =
+            test_event_loop_with_config(&Config::default().with_follow_symlinks(false));
+        event_loop
+            .add_watch(WatchPath::new(&root).unwrap(), recursive_watch())
+            .unwrap();
+        event_loop
+            .add_watch(
+                WatchPath::new(&link).unwrap(),
+                non_recursive_watch().with_dereference_symlinks(false),
+            )
+            .unwrap();
+        let with_separator = PathBuf::from(format!("{}/", link.display()));
+        event_loop.unwatch(with_separator).unwrap();
+        assert!(!event_loop.watches.contains_key(&link.join("nested")));
+    }
+
+    #[test]
+    fn unwatching_a_link_watch_does_not_walk_a_link_loop() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().join("root");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+
+        let mut event_loop = test_event_loop();
+        // The walk reports the link as a loop and does not walk it.
+        let _ = event_loop.add_watch(WatchPath::new(&root).unwrap(), recursive_watch());
+        event_loop
+            .add_watch(
+                WatchPath::new(&link).unwrap(),
+                non_recursive_watch().with_dereference_symlinks(false),
+            )
+            .unwrap();
+        event_loop.unwatch(link.clone()).unwrap();
+        assert!(!event_loop.watches.contains_key(&link.join("a")));
+    }
+
+    #[test]
+    fn unwatching_a_link_watch_does_not_walk_a_loop_below_the_link() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().join("root");
+        let outside = tmpdir.path().join("outside");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        std::os::unix::fs::symlink(&root, outside.join("back")).unwrap();
+
+        let mut event_loop = test_event_loop();
+        // The walk reports `link/back` as a loop and does not walk it.
+        let _ = event_loop.add_watch(WatchPath::new(&root).unwrap(), recursive_watch());
+        assert!(event_loop.watches.contains_key(&link));
+        assert!(
+            !event_loop
+                .watches
+                .contains_key(&link.join("back").join("a"))
+        );
+        event_loop
+            .add_watch(
+                WatchPath::new(&link).unwrap(),
+                non_recursive_watch().with_dereference_symlinks(false),
+            )
+            .unwrap();
+        event_loop.unwatch(link.clone()).unwrap();
+        assert!(event_loop.watches.contains_key(&link));
+        assert!(
+            !event_loop
+                .watches
+                .contains_key(&link.join("back").join("a"))
+        );
+    }
+
+    #[test]
+    fn unwatching_a_link_watch_walks_the_link_for_a_nested_watch() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let outer = tmpdir.path().join("outer");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let link = inner.join("link");
+        std::os::unix::fs::symlink(&outer, &link).unwrap();
+
+        let mut event_loop = test_event_loop();
+        // The walk of `outer` reports `inner/link` as a loop. The walk of `inner` follows the
+        // link to `outer`, which it has not passed through.
+        let _ = event_loop.add_watch(WatchPath::new(&outer).unwrap(), recursive_watch());
+        let _ = event_loop.add_watch(WatchPath::new(&inner).unwrap(), recursive_watch());
+        assert!(event_loop.watches.contains_key(&link.join("inner")));
+        event_loop
+            .add_watch(
+                WatchPath::new(&link).unwrap(),
+                non_recursive_watch().with_dereference_symlinks(false),
+            )
+            .unwrap();
+        event_loop.unwatch(link.clone()).unwrap();
+        assert!(event_loop.watches.contains_key(&link.join("inner")));
+    }
+
+    #[test]
+    fn unwatching_a_watch_on_a_carved_out_directory_keeps_it_carved_out() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().to_path_buf();
+        let child = root.join("child");
+        std::fs::create_dir_all(child.join("sub")).unwrap();
+
+        let mut event_loop = test_event_loop();
+        event_loop
+            .add_watch(WatchPath::new(&root).unwrap(), recursive_watch())
+            .unwrap();
+        event_loop.unwatch(child.clone()).unwrap();
+        event_loop
+            .add_watch(WatchPath::new(&child).unwrap(), non_recursive_watch())
+            .unwrap();
+        event_loop.unwatch(child.clone()).unwrap();
+        assert!(!event_loop.watches.contains_key(&child.join("sub")));
     }
 
     #[test]

@@ -21,6 +21,7 @@
 - FIX: [inotify] keep the watch of another path on the same inode when a watch fails because its path was deleted
 - FIX: [inotify] [kqueue] keep watching the directories below a watch inside a recursive watch when the inner watch is unwatched
 - FIX: [kqueue] keep a path that a recursive watch reached unwatched after `unwatch`, instead of watching it again on the next write to its parent directory. A path that kqueue cannot open again is watched again once it can be opened
+- FIX: [inotify] a recursive watch reports the changes below a symbolic link again after a watch on the link without dereference is unwatched or rewatched with dereference
 
 [#703]: https://github.com/notify-rs/notify/issues/703
 [#455]: https://github.com/notify-rs/notify/issues/455

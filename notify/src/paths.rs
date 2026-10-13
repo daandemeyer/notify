@@ -19,6 +19,16 @@ impl WatchPath {
     }
 }
 
+/// Returns `path` without a trailing separator. `lstat` follows a symbolic link when the path
+/// ends with a separator.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn without_trailing_separator(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => parent.join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
 pub(crate) fn absolute_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
